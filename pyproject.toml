@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rwkv-metal"
+version = "0.1.0"
+description = "RWKV-7 on Apple Silicon (Metal/MLX): pretraining, LoRA/QLoRA, and a custom WKV-7 kernel"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "ImpulseLeap" }]
+keywords = ["rwkv", "mlx", "metal", "apple-silicon", "llm", "pretraining", "lora"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+]
+dependencies = [
+    "mlx>=0.31",
+    "numpy",
+]
+
+[project.optional-dependencies]
+data = ["tokenizers"]
+wandb = ["wandb"]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://impulseleap.com"
+
+[project.scripts]
+rwkv-metal-pretrain = "rwkv_metal.pretrain.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rwkv_metal*"]
+
+[tool.setuptools.package-data]
+"rwkv_metal.tokenizer" = ["*.txt"]
