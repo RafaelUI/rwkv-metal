@@ -1,0 +1,38 @@
+# ── Model weights / data (never commit large files; host on HuggingFace) ────
+*.pth
+*.safetensors
+*.bin
+*.npz
+*.gguf
+weights/
+checkpoints/
+data/
+RWKV7-*/
+*-mlx-*bit/
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+*.egg
+
+# ── Tools / OS ──────────────────────────────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.DS_Store
+*.swp
+
+# ── Logs / experiment tracking ──────────────────────────────────────────────
+wandb/
+*.log
+
+# ── Keep the bundled World vocab (it's small package data, not a model) ──────
+!rwkv_metal/tokenizer/rwkv_vocab_v20230424.txt
