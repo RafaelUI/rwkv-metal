@@ -9,7 +9,7 @@ description = "RWKV-7 on Apple Silicon (Metal/MLX): pretraining, LoRA/QLoRA, and
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "ImpulseLeap" }]
+authors = [{ name = "ImpulseLeap / Alexei Goncharov" }]
 keywords = ["rwkv", "mlx", "metal", "apple-silicon", "llm", "pretraining", "lora"]
 classifiers = [
     "Programming Language :: Python :: 3",
