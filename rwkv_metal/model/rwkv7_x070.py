@@ -125,7 +125,10 @@ class RWKV_Tmix_x070(nn.Module):
         out, _ = wkv7(r, w, k, v, -kk, kk * a, training=True)  # (B,T,H,S)
 
         # Порядок официала: ln_x (GroupNorm) ДО bonus
-        out = self.ln_x(out.reshape(B, T, D)).reshape(B, T, H, S)
+        # ln_x per-token: канон RWKV-7 — F.group_norm(x.view(B*T, C), H).
+        # reshape(B, T, D) подал бы [B,T,D] в MLX GroupNorm, и та усреднила бы
+        # по ВСЕМ T внутри головы (утечка будущего при teacher-forcing).
+        out = self.ln_x(out.reshape(B * T, D)).reshape(B, T, H, S)
         bonus = (r * k * self.r_k).sum(axis=-1, keepdims=True) * v
         out = (out + bonus).reshape(B, T, D)
 
