@@ -24,8 +24,7 @@ fast and fits in unified memory.
 Requires macOS on Apple Silicon and Python 3.10+.
 
 ```bash
-git clone <repo>
-cd rwkv-metal
+pip install rwkv-metal==0.1.0
 pip install -e .
 # optional extras:
 pip install -e ".[data]"    # tokenizers, for .txt -> .bin tokenization
