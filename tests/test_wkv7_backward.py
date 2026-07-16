@@ -1,5 +1,7 @@
 """Golden correctness and determinism tests for WKV-7 Metal backward."""
 
+import numpy as np
+
 import mlx.core as mx
 
 from rwkv_metal.kernel import (
@@ -11,6 +13,7 @@ from rwkv_metal.kernel import (
 B, T, H, D = 2, 64, 4, 64
 GRADIENT_NAMES = ("dr", "dw", "dk", "dv", "da", "db", "dh_in")
 GOLDEN_REL_ERR = 1e-5
+RACE_B, RACE_T, RACE_H, RACE_D = 1, 512, 24, 64
 
 
 def _make_inputs():
@@ -92,15 +95,74 @@ def test_backward_gradients_match_einsum_reference():
 
 
 def test_backward_is_bitwise_deterministic():
-    """Identical compiled Metal backward calls return identical gradients."""
-    inputs, metal_grad, _ = _gradient_functions()
-    first = metal_grad(*inputs)
-    second = metal_grad(*inputs)
-    mx.eval(*first, *second)
+    """Large independent dispatches return bitwise-identical gradients.
 
-    for name, first_gradient, second_gradient in zip(
-        GRADIENT_NAMES, first, second
-    ):
-        assert mx.array_equal(first_gradient, second_gradient), (
-            f"gradient {name} changed across identical backward dispatches"
+    The T=64/H=4 golden fixture is deliberately small for the CPU reference,
+    but is not stressful enough to expose the missing-barrier race reliably.
+    This regression instead uses the original T=512/H=24 bf16 workload, runs
+    two eager plus three compiled backwards, and recreates every primal before
+    each evaluated call so every sample requires an independent Metal dispatch.
+    """
+    mx.random.seed(77)
+    shape = (RACE_B, RACE_T, RACE_H, RACE_D)
+    race_inputs = (
+        (mx.random.normal(shape) * 0.3).astype(mx.bfloat16),
+        (
+            mx.sigmoid(mx.random.normal(shape) * 1.2) * 0.25 + 0.74
+        ).astype(mx.bfloat16),
+        (mx.random.normal(shape) * 0.3).astype(mx.bfloat16),
+        (mx.random.normal(shape) * 0.3).astype(mx.bfloat16),
+        (mx.random.normal(shape) * 0.09).astype(mx.bfloat16),
+        (mx.random.normal(shape) * 0.09).astype(mx.bfloat16),
+    )
+    h_in = (mx.random.normal((RACE_B, RACE_H, RACE_D, RACE_D)) * 0.05).astype(
+        mx.float32
+    )
+    mx.eval(*race_inputs, h_in)
+
+    # Store canonical fp32 host copies. Each run reconstructs fresh bf16 MLX
+    # arrays from these values, so lazy graph reuse cannot satisfy two samples
+    # with a single previously materialized backward dispatch.
+    input_values = tuple(
+        np.array(value.astype(mx.float32), copy=True) for value in race_inputs
+    )
+    h_in_value = np.array(h_in, copy=True)
+    kernel = make_wkv7_checkpoint_with_state(
+        RACE_B, RACE_T, RACE_H, RACE_D
+    )
+
+    def loss_fn(r, w, k, v, a, b, state):
+        output, h_out = kernel(r, w, k, v, a, b, state)
+        time_weights = mx.linspace(0.5, 1.5, RACE_T)[None, :, None, None]
+        state_weights = mx.linspace(-0.3, 0.7, RACE_D)[None, None, None, :]
+        return mx.mean(output * time_weights) + mx.mean(h_out * state_weights)
+
+    eager = mx.grad(loss_fn, argnums=list(range(7)))
+    compiled = mx.compile(mx.grad(loss_fn, argnums=list(range(7))))
+
+    def run(grad_fn):
+        current_inputs = tuple(
+            mx.array(value).astype(mx.bfloat16) for value in input_values
         )
+        current_h_in = mx.array(h_in_value)
+        gradients = grad_fn(*current_inputs, current_h_in)
+        mx.eval(*gradients)
+        return tuple(
+            np.array(gradient.astype(mx.float32), copy=True)
+            for gradient in gradients
+        )
+
+    runs = [run(eager), run(eager), run(compiled), run(compiled), run(compiled)]
+    reference = runs[0]
+    for run_index, gradients in enumerate(runs[1:], start=2):
+        for name, expected, actual in zip(
+            GRADIENT_NAMES, reference, gradients
+        ):
+            np.testing.assert_array_equal(
+                actual,
+                expected,
+                err_msg=(
+                    f"gradient {name} changed on independent backward "
+                    f"dispatch {run_index}"
+                ),
+            )
