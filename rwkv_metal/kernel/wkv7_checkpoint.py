@@ -2,22 +2,23 @@
 wkv7_checkpoint.py — full-sequence Metal kernel
 ================================================
 Forward и backward — по ОДНОМУ GPU-вызову на весь T.
-Убирает 16 Python-итераций + mx.eval() и 32 GPU sync-точки.
+Убирает N Python-итераций + mx.eval() и N GPU sync-точек.
 
 Ключевые идеи:
   Forward:  один kernel, обрабатывает все T токенов,
-            сохраняет h после каждых CHUNK=32 токенов → h_checkpoints[B,H,N,D,D]
+            сохраняет h после каждых CHUNK=16 токенов → h_checkpoints[B,H,N,D,D]
 
   Backward: один kernel, внешний цикл по N чанкам (GPU-side),
             читает h_checkpoints[c] вместо реконструкции с нуля
-            → стабильно численно (только 32 шага /w за чанк, не 512)
+            → стабильно численно (только 16 шагов /w за чанк, не 512;
+              32 признан community нестабильным для backward на высокой размерности)
 
 Результат: 1.73× ускорение vs v2 chunked (T=512, медиана 40 итераций)
 """
 import mlx.core as mx
 
 HEAD_SIZE = 64
-CHUNK = 32
+CHUNK = 16
 
 _fwd_cache: dict = {}
 _bwd_cache: dict = {}
@@ -188,7 +189,7 @@ def make_wkv7_checkpoint_with_state(B: int, T: int, H: int, D: int = HEAD_SIZE):
     def _fwd(r, w, k, v, a, b, h_in):
         res = _get_ckpt_fwd(H, T)(
             inputs=[x.astype(mx.float32) for x in [r, w, k, v, a, b, h_in]],
-            grid=(B*H, D, 1), threadgroup=(1, 1, 1),
+            grid=(B*H, D, 1), threadgroup=(1, D, 1),
             output_shapes=[(B,T,H,D), (B,H,D,D), (B,T,H,D), (B,H,N,D,D)],
             output_dtypes=[mx.float32]*4,
         )

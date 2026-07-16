@@ -16,7 +16,7 @@ import mlx.core as mx
 from .wkv7_checkpoint import make_wkv7_checkpoint
 
 HEAD_SIZE = 64
-CHUNK     = 32
+CHUNK     = 16
 
 # ─────────────────── Fallback: чистый Python einsum (для отладки) ────────────
 
@@ -246,7 +246,7 @@ _ckpt_cache: dict = {}
 
 def wkv7_train(r, w, k, v, a, b):
     B, T, H, D = r.shape
-    # T должно делиться на CHUNK=32; паддинг если нет
+    # T должно делиться на CHUNK=16; паддинг если нет
     if T % CHUNK != 0:
         pad = CHUNK - (T % CHUNK)
         def p(x, val=0.0):

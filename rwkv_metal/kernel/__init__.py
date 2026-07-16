@@ -14,7 +14,8 @@ WKV-7 ядро на Metal: forward / backward (checkpoint) / inference.
 
 Константы:
     HEAD_SIZE = 64   — размерность головы (фиксирована ядром)
-    CHUNK     = 32   — размер чанка для checkpoint-стратегии
+    CHUNK     = 16   — размер чанка для checkpoint-стратегии (community: <=16,
+                       32 нестабилен для backward на высокой размерности)
 """
 from .wkv7 import (
     wkv7,
