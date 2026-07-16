@@ -34,9 +34,10 @@ def _wkv7_chunk_py(r, w, k, v, a, b, h):
         outs.append(y)
     return mx.stack(outs, axis=1), h
 
-def wkv7_train_py(r, w, k, v, a, b):
+def wkv7_train_py_with_state(r, w, k, v, a, b, h_in):
+    """Einsum reference with an explicit initial state and returned final state."""
     B, T, H, D = r.shape
-    h = mx.zeros((B, H, D, D))
+    h = h_in
     outs = []
     for start in range(0, T, CHUNK):
         end = min(start + CHUNK, T); cl = end - start
@@ -48,7 +49,15 @@ def wkv7_train_py(r, w, k, v, a, b):
             rc=p(rc);wc=p(wc,1.0);kc=p(kc);vc=p(vc);ac=p(ac);bc=p(bc)
         out_c, h = _wkv7_chunk_py(rc,wc,kc,vc,ac,bc,h)
         outs.append(out_c[:,:cl])
-    return mx.concatenate(outs, axis=1)
+    return mx.concatenate(outs, axis=1), h
+
+
+def wkv7_train_py(r, w, k, v, a, b):
+    B, _, H, D = r.shape
+    out, _ = wkv7_train_py_with_state(
+        r, w, k, v, a, b, mx.zeros((B, H, D, D))
+    )
+    return out
 
 # ─────────────────── Metal training kernels (fwd + bwd) ─────────────────────
 
@@ -186,6 +195,10 @@ constant uint H_C         = {H};
 
         for (uint dk=0; dk<HEAD_SIZE_C; dk++)
             C_row[dk] = C_row[dk]*w_sh[dk] + dsa_dv*a_sh[dk];
+
+        // The next timestep overwrites the threadgroup arrays above. Wait
+        // until every thread has finished reading the current w_sh/a_sh.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     for (uint dk=0; dk<HEAD_SIZE_C; dk++) dh_in_out[h_base+dk] = C_row[dk];

@@ -155,6 +155,10 @@ constant uint H_C         = {H};
 
             for (uint dk=0; dk<HEAD_SIZE_C; dk++)
                 C_row[dk] = C_row[dk]*w_sh[dk] + dsa_dv*a_sh[dk];
+
+            // The next timestep overwrites the threadgroup arrays above. Wait
+            // until every thread has finished reading the current w_sh/a_sh.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
     for (uint dk=0; dk<HEAD_SIZE_C; dk++) dh_in_out[hb+dk] = C_row[dk];
@@ -169,14 +173,16 @@ constant uint H_C         = {H};
     return kern
 
 
-def make_wkv7_checkpoint(B: int, T: int, H: int, D: int = HEAD_SIZE):
+def make_wkv7_checkpoint_with_state(B: int, T: int, H: int, D: int = HEAD_SIZE):
     """
-    Создаёт функцию wkv7_train использующую checkpoint-kernel.
-    Принимает те же аргументы что wkv7_train из wkv7.py.
+    Create a stateful checkpoint-kernel function.
+
+    The returned callable accepts ``(r, w, k, v, a, b, h_in)`` and returns
+    ``(out, h_out)``. Exposing the boundary state makes the full VJP, including
+    ``d_h_in``, available for correctness tests and state-tuning use cases.
     """
     assert T % CHUNK == 0, f"T={T} должно делиться на CHUNK={CHUNK}"
     N = T // CHUNK
-    h0 = mx.zeros((B, H, D, D))
 
     @mx.custom_function
     def _fwd(r, w, k, v, a, b, h_in):
@@ -205,9 +211,24 @@ def make_wkv7_checkpoint(B: int, T: int, H: int, D: int = HEAD_SIZE):
         grads = [res[0], res[1], res[2], res[3], res[4], res[5], res[6]]
         return [g.astype(p.dtype) for g, p in zip(grads, primals)]
 
+    def wkv7_train_with_state(r, w, k, v, a, b, h_in):
+        out, h_out, _, _ = _fwd(r, w, k, v, a, b, h_in)
+        return out, h_out
+
+    return wkv7_train_with_state
+
+
+def make_wkv7_checkpoint(B: int, T: int, H: int, D: int = HEAD_SIZE):
+    """
+    Создаёт функцию wkv7_train использующую checkpoint-kernel.
+    Принимает те же аргументы что wkv7_train из wkv7.py.
+    """
+    wkv7_train_with_state = make_wkv7_checkpoint_with_state(B, T, H, D)
+    h0 = mx.zeros((B, H, D, D))
+
     def wkv7_train(r, w, k, v, a, b):
         """Drop-in замена для wkv7_train из wkv7.py"""
-        out, _, _, _ = _fwd(r, w, k, v, a, b, h0)
+        out, _ = wkv7_train_with_state(r, w, k, v, a, b, h0)
         return out
 
     return wkv7_train
