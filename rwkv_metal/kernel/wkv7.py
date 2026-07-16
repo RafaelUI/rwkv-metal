@@ -267,11 +267,17 @@ def wkv7_train(r, w, k, v, a, b):
 
 _infer_cache = {}
 
-def _get_infer_kernel(H: int):
-    if H in _infer_cache: return _infer_cache[H]
+def _get_infer_kernel(H: int, T: int = None):
+    # T -- число шагов, зашиваемое в кернель константой (кеш по (H, T)).
+    # По умолчанию CHUNK -- прежнее поведение. T=1 для single-token decode
+    # убирает CHUNKx лишней работы (раньше недостающие шаги паддились
+    # no-op'ами и весь чанк считался целиком).
+    if T is None: T = CHUNK
+    key = (H, T)
+    if key in _infer_cache: return _infer_cache[key]
     hdr = f"""
 constant uint HEAD_SIZE_C = {HEAD_SIZE};
-constant uint CHUNK_C     = {CHUNK};
+constant uint CHUNK_C     = {T};
 constant uint H_C         = {H};
 """
     body = r"""
@@ -297,20 +303,20 @@ constant uint H_C         = {H};
     for (uint dk=0; dk<HEAD_SIZE_C; dk++) h_out[h_base+dk] = h_row[dk];
 """
     kern = mx.fast.metal_kernel(
-        name=f"wkv7_infer_{H}",
+        name=f"wkv7_infer_{H}_{T}",
         input_names=["r","w","k","v","a","b","h_in"],
         output_names=["out","h_out"],
         header=hdr, source=body,
     )
-    _infer_cache[H] = kern
+    _infer_cache[key] = kern
     return kern
 
 def wkv7_infer(r, w, k, v, a, b, h):
     B, T, H, D = r.shape
     assert D == HEAD_SIZE, f"HEAD_SIZE mismatch: got {D}, expected {HEAD_SIZE}"
-    assert T == CHUNK,     f"T must equal CHUNK={CHUNK} for inference"
+    assert T >= 1, "T must be >= 1"
     inputs = [x.astype(mx.float32) for x in [r,w,k,v,a,b,h]]
-    res = _get_infer_kernel(H)(
+    res = _get_infer_kernel(H, T)(
         inputs=inputs,
         grid=(B*H, D, 1), threadgroup=(1, 1, 1),
         output_shapes=[(B,T,H,D), (B,H,D,D)],

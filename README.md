@@ -14,9 +14,6 @@ fast and fits in unified memory.
 - A custom **Metal WKV-7 kernel** (forward + checkpointed backward + inference).
 - Designed for **16 GB** Macs: bf16, gradient checkpointing, QLoRA 4-bit base.
 
-> Status: early (v0.1). The kernel and training/LoRA stacks are validated; APIs
-> may still change.
-
 ---
 
 ## Install
@@ -24,7 +21,7 @@ fast and fits in unified memory.
 Requires macOS on Apple Silicon and Python 3.10+.
 
 ```bash
-pip install rwkv-metal==0.1.0
+pip install rwkv-metal
 pip install -e .
 # optional extras:
 pip install -e ".[data]"    # tokenizers, for .txt -> .bin tokenization
