@@ -155,6 +155,10 @@ constant uint H_C         = {H};
 
             for (uint dk=0; dk<HEAD_SIZE_C; dk++)
                 C_row[dk] = C_row[dk]*w_sh[dk] + dsa_dv*a_sh[dk];
+
+            // The next timestep overwrites the threadgroup arrays above. Wait
+            // until every thread has finished reading the current w_sh/a_sh.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
     for (uint dk=0; dk<HEAD_SIZE_C; dk++) dh_in_out[hb+dk] = C_row[dk];
