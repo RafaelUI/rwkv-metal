@@ -56,6 +56,7 @@ defaults; you only set what you care about.
 
 ```python
 from rwkv_metal import PretrainConfig
+import rwkv_metal as rk
 
 cfg = PretrainConfig(
     # ── Architecture ──────────────────────────────────────────────
@@ -102,6 +103,7 @@ cfg = PretrainConfig(
     wandb           = False,
     wandb_project   = "rwkv-metal",
 )
+rk.pretrain(cfg)
 ```
 
 ### Field reference

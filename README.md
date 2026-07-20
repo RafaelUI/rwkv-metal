@@ -76,6 +76,24 @@ finetune(model, batches, LoRAConfig(lr=1e-4, grad_accum=8, max_steps=2000))
 See **[docs/lora.md](docs/lora.md)** for the full LoRA/QLoRA guide and the
 validated low-memory recipe.
 
+### Inference
+
+```python
+import mlx.core as mx
+import rwkv_metal as rk
+
+model, cfg = rk.load_pretrained("weights/RWKV-x070-World-1.5B.pth")
+tok = rk.WorldTokenizer()
+
+ids = tok.encode("User: What is the capital of France?\n\nAssistant:")
+logits = model(mx.array(ids)[None, :])[0, -1]   # next-token distribution
+```
+
+Works the same way for a quantized `.rwkvq` checkpoint (2-3x smaller, via the
+companion [rwkv-quant](https://github.com/impulseleap/rwkv-quant) repo). See
+**[docs/inference.md](docs/inference.md)** for sampling, a generation loop,
+and the quantized-inference pipeline.
+
 ---
 
 ## What's inside
@@ -144,3 +162,7 @@ the community:
 ## License
 
 Apache-2.0.
+
+## Author
+
+Alexei Goncharov

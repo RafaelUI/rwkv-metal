@@ -20,6 +20,8 @@ pre_materialize_hook) -- экономит пик памяти ЗАГРУЗКИ, 
 """
 from .lora import LoRALinear, TMIX_TARGETS, _unfreeze_adapters, _param_stats
 from .rwkvq_linear import RwkvqLinear
+from .rwkvq_native import RwkvqNativeLinear
+from .rwkvq_hybrid import RwkvqHybridLinear
 import mlx.core as mx
 
 _TMIX_KEY = {"r_proj": "receptance", "k_proj": "key", "v_proj": "value", "o_proj": "output"}
@@ -27,11 +29,27 @@ _TMIX_KEY = {"r_proj": "receptance", "k_proj": "key", "v_proj": "value", "o_proj
 
 def _replace_targets_with_rwkvq(model, sidecar_path: str, rank: int, alpha: float,
                                  dropout: float, tmix_targets, quantize_cmix: bool,
-                                 quantize_head: bool, layers) -> list:
+                                 quantize_head: bool, layers, native: bool = True) -> list:
     """setattr-замена proj/cmix/head на RwkvqLinear/LoRALinear. Без
     freeze()/eval() -- вызывающий код решает, когда их делать (для
     load_lora_rwkvq_model это откладывается до конца, после материализации
-    остального bf16, чтобы был один проход eval, а не два)."""
+    остального bf16, чтобы был один проход eval, а не два).
+
+    native=True (по умолчанию): RwkvqNativeLinear -- перепаковка в
+    родной MLX quantized_matmul (быстрее на 15-70% на реальных тензорах,
+    см. tests/dev_bench_native_qmm.py; та же кернель-функция, что у
+    стокового QLoRA). native=False: RwkvqLinear со своим fused-кернелем
+    (rwkvq_kernel.py) -- держим для кросс-проверки/отладки, требует
+    меньше one-time setup при загрузке (нет перепаковки битов).
+    native="hybrid": RwkvqHybridLinear -- родная упаковка кодов + компактные
+    sb6 scale/bias, развёрнутые на лету (см. rwkvq_hybrid.py) -- память
+    как у fused-кернеля, но на маленьких тензорах МЕДЛЕННЕЕ native из-за
+    launch-overhead разворачивания (см. tests/dev_check_hybrid.py)."""
+    if native == "hybrid":
+        Backend = RwkvqHybridLinear
+    else:
+        Backend = RwkvqNativeLinear if native else RwkvqLinear
+    _from_sidecar = Backend.from_sidecar
     n_layer = len(model.blocks)
     sel = set(range(n_layer)) if layers is None else set(i % n_layer for i in layers)
     wrapped = []
@@ -44,7 +62,7 @@ def _replace_targets_with_rwkvq(model, sidecar_path: str, rank: int, alpha: floa
             if mod is None:
                 continue
             key = f"blocks.{li}.att.{_TMIX_KEY[name]}.weight"
-            base = RwkvqLinear.from_sidecar(sidecar_path, key)
+            base = _from_sidecar(sidecar_path, key)
             setattr(blk.tmix, name, LoRALinear(rank=rank, alpha=alpha,
                                                 dropout=dropout, base_module=base))
             wrapped.append(f"tmix.{name}")
@@ -52,10 +70,10 @@ def _replace_targets_with_rwkvq(model, sidecar_path: str, rank: int, alpha: floa
         if quantize_cmix:
             for name in ("key", "value"):
                 key = f"blocks.{li}.ffn.{name}.weight"
-                setattr(blk.cmix, name, RwkvqLinear.from_sidecar(sidecar_path, key))
+                setattr(blk.cmix, name, _from_sidecar(sidecar_path, key))
 
     if quantize_head:
-        model.head = RwkvqLinear.from_sidecar(sidecar_path, "head.weight")
+        model.head = _from_sidecar(sidecar_path, "head.weight")
 
     return wrapped
 
@@ -63,13 +81,14 @@ def _replace_targets_with_rwkvq(model, sidecar_path: str, rank: int, alpha: floa
 def add_lora_rwkvq(model, sidecar_path: str, rank: int = 16, alpha: float = 32.0,
                     dropout: float = 0.0, tmix_targets=TMIX_TARGETS,
                     quantize_cmix: bool = True, quantize_head: bool = True,
-                    layers=None):
+                    layers=None, native: bool = True):
     """Как _replace_targets_with_rwkvq, но на УЖЕ полностью загруженной
     (bf16) модели -- удобно для экспериментов, но платит полный пик
     загрузки .pth. Для тренировки с нуля предпочтительнее
     load_lora_rwkvq_model (ленивая загрузка)."""
     wrapped = _replace_targets_with_rwkvq(model, sidecar_path, rank, alpha, dropout,
-                                           tmix_targets, quantize_cmix, quantize_head, layers)
+                                           tmix_targets, quantize_cmix, quantize_head,
+                                           layers, native=native)
     model.freeze()
     _unfreeze_adapters(model)
     mx.eval(model.parameters())
@@ -105,7 +124,8 @@ def _rwkvq_skip_keys(pth_path, tmix_targets, quantize_cmix, quantize_head, layer
 def load_lora_rwkvq_model(pth_path, sidecar_path, rank: int = 16, alpha: float = 32.0,
                            dropout: float = 0.0, tmix_targets=TMIX_TARGETS,
                            quantize_cmix: bool = True, quantize_head: bool = True,
-                           layers=None, config=None, verbose: bool = True):
+                           layers=None, config=None, verbose: bool = True,
+                           native: bool = True):
     """Загрузка + QLoRA-обвязка ЗА ОДИН заход. proj/cmix/head заменяются
     на RwkvqLinear СРАЗУ после конструирования скелета модели -- ДО того,
     как их случайная bf16-инициализация (полного размера, из
@@ -123,7 +143,7 @@ def load_lora_rwkvq_model(pth_path, sidecar_path, rank: int = 16, alpha: float =
     def hook(m):
         wrapped_holder.extend(_replace_targets_with_rwkvq(
             m, sidecar_path, rank, alpha, dropout, tmix_targets,
-            quantize_cmix, quantize_head, layers))
+            quantize_cmix, quantize_head, layers, native=native))
 
     model, cfg = load_pretrained_partial(pth_path, skip_keys, config=config, verbose=verbose,
                                           pre_materialize_hook=hook)

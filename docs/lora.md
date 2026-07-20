@@ -8,7 +8,8 @@ loop that bakes in the validated low-memory recipe.
 - [Quick start](#quick-start)
 - [Loading official weights](#loading-official-weights)
 - [`add_lora`](#add_lora)
-- [QLoRA: 4-bit base](#qlora-4-bit-base)
+- [QLoRA: 4-bit base (stock)](#qlora-4-bit-base-stock)
+- [QLoRA on a quantized `.rwkvq` base (rwkv-quant)](#qlora-on-a-quantized-rwkvq-base-rwkv-quant)
 - [`LoRAConfig` and `finetune`](#loraconfig-and-finetune)
 - [Saving, loading, merging adapters](#saving-loading-merging-adapters)
 - [The validated recipe (why these defaults)](#the-validated-recipe-why-these-defaults)
@@ -139,7 +140,7 @@ capacity, so `range(12, 24)` (top half) is a good balance.
 
 ---
 
-## QLoRA: 4-bit base
+## QLoRA: 4-bit base (stock)
 
 Quantizing the frozen base to 4-bit is the **main memory lever** for large
 models. The recipe quantizes only the *big* frozen matrices and leaves the small
@@ -168,6 +169,100 @@ dequantization. This is what lets a 1.5B fine-tune fit comfortably in 16 GB.
 > low-rank matrices (`w/a/g/v` with ranks like 96/256/64/32) are not multiples of
 > `group_size` and will fail/degrade. `quantize_base_model` targets only the big
 > ones (`cmix.key/value`, `head`, `emb`) on purpose.
+
+> This is the generic path: `mlx.nn.quantize` with a uniform bit width and
+> group size, no RWKV-7-specific calibration. It's the simplest option (no
+> second repo, no extra files) and a reasonable default. For a pretrained base
+> where you want the best size/quality tradeoff, see the next section.
+
+---
+
+## QLoRA on a quantized `.rwkvq` base (rwkv-quant)
+
+[`rwkv-quant`](https://github.com/impulseleap/rwkv-quant) is a companion
+project that calibrates RWKV-7-specific quantization (per-group bit widths,
+outlier handling) instead of quantizing every matrix uniformly, and ships two
+presets tuned by direct perplexity measurement:
+
+| Preset | Size vs bf16 | ppl vs bf16 | Use for |
+|---|---|---|---|
+| `reduction` | 2.35x smaller | +0.12% | QLoRA base — calibrated for near-zero degradation |
+| `compression` | 3.04x smaller | +2.47% | Smaller footprint, small but real quality cost |
+
+`reduction` is the validated default for QLoRA: it's specifically calibrated
+so the base itself contributes negligible error before you even start
+training adapters on top of it. `compression` uses the same code path in
+`rwkv-metal` (the kernel is generic across 4/5/6-bit groups) but hasn't been
+benchmarked end-to-end for QLoRA training the way `reduction` has — treat it
+as untested rather than unsupported if you want to try it.
+
+This is a two-repo pipeline: `rwkv-quant` produces and exports the quantized
+weights (needs torch), `rwkv-metal` trains against them (does not need torch).
+
+### 1. Quantize + export (in `rwkv-quant`)
+
+```bash
+cd rwkv-quant
+python -c "
+from rwkv_quant.api import quantize
+quantize('weights/RWKV-x070-World-1.5B.pth', '/tmp/world15b.rwkvq', preset='reduction')
+"
+python -m rwkv_quant.formats.export_mlx /tmp/world15b.rwkvq /tmp/world15b.rwkvq_mlx
+```
+
+`export_mlx` is a one-time step: it repacks the `.rwkvq` (which requires torch
+to read) into a `*.rwkvq_mlx.safetensors` + `.json` sidecar that `rwkv-metal`
+loads with plain `mx.load`, no torch involved from here on.
+
+### 2. QLoRA against the sidecar (in `rwkv-metal`)
+
+```python
+import rwkv_metal as rk
+from rwkv_metal.lora import LoRAConfig, finetune
+
+model, cfg, info = rk.lora.load_lora_rwkvq_model(
+    "weights/RWKV-x070-World-1.5B.pth",   # shape/name metadata + non-quantized tensors
+    "/tmp/world15b.rwkvq_mlx",            # sidecar path (no extension)
+    rank=16, alpha=32.0,
+    layers=range(12, 24),                 # same speed lever as stock QLoRA
+)
+print(f"trainable: {info['trainable_pct']:.3f}%")
+
+finetune(model, batches, LoRAConfig(lr=1e-4, grad_accum=8, max_steps=2000))
+```
+
+`load_lora_rwkvq_model` replaces the big frozen matrices (`r/k/v/o_proj`,
+`cmix.key/value`, `head`) with quantized modules *before* their bf16
+placeholder weights are materialized from the `.pth`, so the loading peak is
+lower too, not just the steady-state footprint — see
+`model/convert.py::load_pretrained_partial`. `add_lora_rwkvq` is the
+equivalent entry point if you already have a fully-loaded bf16 model in hand
+(simpler, but pays the full bf16 loading peak first).
+
+### Backend choice (`native=`)
+
+| `native=` | Mechanism | Measured step time (1.5B, rank 16, top-half layers) | Notes |
+|---|---|---|---|
+| `True` (default) | Repacked into MLX's own `quantized_matmul` | 0.7-0.8s — ties stock QLoRA exactly (same underlying kernel) | Verified only for `bits=6` (REDUCTION); MLX's internal packing differs by bit width |
+| `False` | Custom fused Metal dequant kernel | 1.2-1.3s | Best memory footprint of the three; bit-width generic (REDUCTION and COMPRESSION both work); doesn't depend on MLX-internal packing details |
+| `"hybrid"` | Native code layout + compact scale/bias unpacked on the fly | 0.8-0.9s | Didn't clearly beat the other two in measurement; kept for reference |
+
+If you want the smallest possible memory footprint, use `native=False`. If you
+want QLoRA training speed to exactly match the stock path while still getting
+`rwkv-quant`'s calibrated accuracy, use `native=True` (REDUCTION only).
+
+### Caveats
+
+- **`emb.weight` is never quantized** by this path — embedding lookup is a
+  gather, not `x @ W^T`, so it stays bf16 regardless of preset.
+- **`merge_lora()` doesn't apply here.** It folds the adapter delta into
+  `linear.weight`, but the quantized modules have no dense `.weight` — the
+  base is dequantized on the fly on every call. Keep base + adapter composed
+  at inference time; see [`inference.md`](./inference.md#quantized-inference-rwkvq).
+  There's no built-in "bake the adapter into a new quantized file" step yet.
+- **`native=True`/`"hybrid"` are only verified for `bits=6`** (the REDUCTION
+  preset's group bit width). If you use COMPRESSION (mixed 4/5-bit groups),
+  use `native=False`.
 
 ---
 
