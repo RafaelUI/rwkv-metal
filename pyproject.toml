@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rwkv-metal"
-version = "0.1.3"
+version = "0.2.0"
 description = "RWKV-7 on Apple Silicon (Metal/MLX): pretraining, LoRA/QLoRA, and a custom WKV-7 kernel"
 readme = "README.md"
 requires-python = ">=3.10"
