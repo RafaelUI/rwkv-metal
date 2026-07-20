@@ -24,23 +24,32 @@ from mlx.utils import tree_flatten, tree_unflatten
 class LoRALinear(nn.Module):
     """Обёртка над nn.Linear: y = W·x (frozen) + (alpha/r)·B(A(x))."""
 
-    def __init__(self, linear: nn.Linear, rank: int = 16, alpha: float = 32.0,
+    def __init__(self, linear: nn.Linear = None, rank: int = 16, alpha: float = 32.0,
                  dropout: float = 0.0, quantize_base: int = 0,
-                 q_group_size: int = 64):
+                 q_group_size: int = 64, base_module=None, dtype=None):
         super().__init__()
-        # dims берём из исходного nn.Linear ДО возможной квантизации
-        out_features, in_features = linear.weight.shape
-        dtype = linear.weight.dtype
+        # base_module: готовый frozen-модуль с (out_features, in_features) и
+        # __call__(x) -- напр. RwkvqLinear (rwkvq_linear.py) поверх нативного
+        # .rwkvq-квантования rwkv-quant, вместо стокового nn.QuantizedLinear.
+        # Тогда `linear` не нужен (dims/dtype берутся из base_module).
+        if base_module is not None:
+            out_features, in_features = base_module.out_features, base_module.in_features
+            dtype = dtype or mx.bfloat16
+            self.linear = base_module
+        else:
+            # dims берём из исходного nn.Linear ДО возможной квантизации
+            out_features, in_features = linear.weight.shape
+            dtype = linear.weight.dtype
+            if quantize_base:
+                # QLoRA: замороженная база в 4/8-бит, адаптеры в исходном dtype
+                self.linear = nn.QuantizedLinear.from_linear(
+                    linear, group_size=q_group_size, bits=quantize_base)
+            else:
+                self.linear = linear
+
         self.rank = rank
         self.scale = alpha / rank
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
-
-        if quantize_base:
-            # QLoRA: замороженная база в 4/8-бит, адаптеры в исходном dtype
-            self.linear = nn.QuantizedLinear.from_linear(
-                linear, group_size=q_group_size, bits=quantize_base)
-        else:
-            self.linear = linear
 
         scale_a = 1.0 / math.sqrt(in_features)
         self.lora_a = mx.random.normal((rank, in_features)).astype(dtype) * scale_a
