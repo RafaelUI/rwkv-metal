@@ -7,6 +7,7 @@
 weights/
 checkpoints/
 data/
+runs/
 RWKV7-*/
 *-mlx-*bit/
 

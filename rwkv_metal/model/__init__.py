@@ -29,6 +29,7 @@ from .rwkv7 import (
     l2_norm,
 )
 from .rwkv7_x070 import RWKV7X070, lora_ranks
+from .state import RWKVState, build_mask, gather_last
 from .convert import load_pretrained, save_converted, load_pth, convert
 from .external import load_local_rwkv7, load_local_tokenizer
 
@@ -43,6 +44,10 @@ __all__ = [
     # official weights
     "RWKV7X070",
     "lora_ranks",
+    # рекуррентное состояние (реранкер, кэш документов, инференс)
+    "RWKVState",
+    "build_mask",
+    "gather_last",
     "load_pretrained",
     "save_converted",
     "load_pth",

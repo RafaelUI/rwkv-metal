@@ -103,6 +103,18 @@ from .embedding import (
     evaluate_classification,
 )
 
+# ── Reranker (cross-encoder поверх рекуррентного состояния) ─────────────────
+from .model.state import RWKVState, build_mask
+from .reranker import (
+    Reranker,
+    RerankerConfig,
+    RerankerInference,
+    RerankTrainConfig,
+    train_reranker,
+    encode_pairs,
+    build_candidates,
+)
+
 __all__ = [
     "__version__",
     # models
@@ -153,4 +165,15 @@ __all__ = [
     "evaluate_retrieval",
     "evaluate_sts_pairwise",
     "evaluate_classification",
+    # state
+    "RWKVState",
+    "build_mask",
+    # reranker
+    "Reranker",
+    "RerankerConfig",
+    "RerankerInference",
+    "RerankTrainConfig",
+    "train_reranker",
+    "encode_pairs",
+    "build_candidates",
 ]

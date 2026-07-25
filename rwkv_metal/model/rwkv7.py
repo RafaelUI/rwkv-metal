@@ -215,12 +215,33 @@ class RWKV7(nn.Module):
         mx.eval(self.parameters())
         return self
 
-    def body(self, idx):
+    def body(self, idx, state=None, mask=None, end_idx=None, return_state=False):
         """Run everything except the lm head; returns hidden states [B, T, D].
 
         Useful when you want hidden states without the (large) vocab projection,
         e.g. custom loss heads or feature extraction.
+
+        ВНИМАНИЕ: работа с состоянием (state / return_state) здесь НЕ
+        поддерживается, и это не «пока не дошли руки». Межблочный перенос
+        token-shift ниже (`x_prev = x[:, -1:]` после каждого блока) отдаёт
+        блоку i+1 в качестве «предыдущего токена» ПОСЛЕДНИЙ токен текущего
+        чанка, то есть будущее относительно позиции 0. Проверяется прямо:
+        смена только последнего токена входа меняет скрытые состояния на
+        позициях 0..T-2 (в x070 — ровно ноль). Из-за этого «продолжить с
+        состояния» невозможно определить так, чтобы оно совпало со сплошным
+        проходом: значение, которое понадобилось бы на границе, зависит от
+        ещё не поступивших токенов.
+
+        Для эмбеддингов, реранкера и любого инференса со state используй
+        RWKV7X070 (официальная архитектура, каузальная).
         """
+        if state is not None or return_state or mask is not None or end_idx is not None:
+            raise NotImplementedError(
+                "RWKV7 (from-scratch арх.) не поддерживает работу с состоянием: "
+                "межблочный перенос token-shift делает продолжение с состояния "
+                "принципиально несовпадающим со сплошным проходом. "
+                "Используй RWKV7X070."
+            )
         B, T    = idx.shape
         x       = self.ln0(self.emb(idx))
         # x_prev must match x.dtype, otherwise silent fp32/bf16 cast in token-shift

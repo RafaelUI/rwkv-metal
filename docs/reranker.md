@@ -1,0 +1,553 @@
+# Reranking with `rwkv_metal`
+
+This guide covers the RWKV-7 **cross-encoder reranker**: scoring
+`(query, document)` pairs directly from the model's recurrent state, training
+the scoring head, and serving it with a cached document index.
+
+A reranker is the second stage of retrieval. An embedding model
+([`embedding.md`](./embedding.md)) is fast but scores a query and a document
+independently — it never sees them together. A cross-encoder reads the pair
+jointly, which is far more accurate and far more expensive, so it only runs on
+the handful of candidates the embedder already shortlisted.
+
+- [The idea](#the-idea)
+- [Quick start](#quick-start)
+- [Why the document comes first](#why-the-document-comes-first)
+- [Anatomy of the head](#anatomy-of-the-head)
+- [`RerankerConfig`: every switch](#rerankerconfig-every-switch)
+- [The state cache: why training is cheap](#the-state-cache-why-training-is-cheap)
+- [Data and candidates](#data-and-candidates)
+- [Losses](#losses)
+- [`RerankTrainConfig`: every switch](#reranktrainconfig-every-switch)
+- [Evaluation](#evaluation)
+- [Full runs](#full-runs)
+- [Measured results](#measured-results)
+- [Model-level state API](#model-level-state-api)
+- [Practical advice](#practical-advice)
+- [Current limitations](#current-limitations)
+
+---
+
+## The idea
+
+A transformer cross-encoder concatenates query and document, runs the stack,
+and reads a score off `[CLS]`. RWKV already folds the whole pair into a
+fixed-size recurrent state `h [H, S, S]` per layer, so the score can be read
+straight from the state instead of from per-token activations.
+
+Concretely: run the pair through a **frozen** base model, take the final WKV
+state, then push one small learnable "probe" token through a short stack of
+RWKV blocks whose recurrence *starts* from that state, and project the result
+to a scalar. Reading `y = h·r` is one attention-like query against everything
+the state accumulated.
+
+Three consequences:
+
+| | |
+|---|---|
+| The head sees the state matrix `[S, S]` per head, not just a `[D]` vector | more to read than a pooled embedding |
+| Head cost is independent of pair length | one or two tokens per block, always |
+| The prefix state is cacheable | a document is encoded once, each query costs only its own tokens |
+
+The design follows the reranker in
+[howard-hou/EmbeddingRWKV](https://github.com/howard-hou/EmbeddingRWKV) in
+spirit; the padding scheme, the state cache, the candidate construction and the
+listwise loss are different (see [Differences](#differences-from-embeddingrwkv)).
+
+---
+
+## Quick start
+
+```python
+import rwkv_metal as rk
+from rwkv_metal.reranker import Reranker, RerankerInference
+
+base, cfg = rk.load_pretrained("weights/rwkv7-g1d-0.1b.pth")
+model = Reranker(base)                       # base is frozen for you
+model.load_head("reranker_head.safetensors") # trained head
+
+rr = RerankerInference(model, rk.WorldTokenizer())
+
+docs = [...]                                  # top-k from your embedder
+for doc_id, score in rr.rank("how do bees overwinter?", docs, top_k=5):
+    print(f"{score:+.2f}  {docs[doc_id][:80]}")
+```
+
+Scores are raw logits: comparable **within** one query, not across queries
+unless you trained with a pointwise term (see [Losses](#losses)).
+
+### Serving many queries against the same documents
+
+```python
+index = rr.build_index(docs)                  # encodes prefixes once
+scores = rr.score_indexed("how do bees overwinter?", index)
+```
+
+`build_index` stores the recurrent state after `Instruct: … \nDocument: {doc}\n`.
+Every later query only pays for its own ~30 tokens. On a 0.1B base this is
+**73 ms → 3.5 ms per pair**, about 20×. The cost is memory: a full state is
+`n_layer · n_head · 64 · 64 · 4` bytes — 2.4 MB per document at 0.1B — so an
+index is for a hot subset (the embedder's top-100), not a whole corpus.
+
+An index is only valid for the base, template and instruction it was built
+with. The state is a function of exactly that prefix.
+
+---
+
+## Why the document comes first
+
+The default template is
+
+```
+Instruct: {instruction}
+Document: {document}
+Query: {query}
+```
+
+Document before query, which reads backwards until you remember that RWKV is an
+RNN: the state after a prefix depends only on that prefix. Putting the document
+first makes `Instruct + Document` a cacheable prefix. Putting the query first
+would throw that away — the state would depend on the query, and nothing could
+be precomputed.
+
+The trade-off is real but small: with the document first, the model encodes it
+without yet knowing the query. It is not "blind", though — the head reads the
+state *after* the query tokens have been folded in, so query-conditioned
+retrieval still happens; it just happens in the head's read-out rather than
+during document encoding.
+
+The other order is available for comparison:
+
+```python
+from rwkv_metal.reranker import PairTemplate
+rr = RerankerInference(model, tok, template=PairTemplate(doc_first=False))
+```
+
+`build_index` refuses to run in that mode rather than silently returning a
+useless index.
+
+### Does the document survive the query tail?
+
+Fair question for an RNN: does the document still matter after 30 more tokens
+of decay? Measured on the 0.1B World base, cosine between the final states of
+two unrelated documents under the same query:
+
+| query tail length | 4 tok | 19 tok | 34 tok | 64 tok | 124 tok | 244 tok |
+|---|---|---|---|---|---|---|
+| cos(state_A, state_B) | 0.9960 | 0.9974 | 0.9977 | 0.9974 | 0.9974 | 0.9974 |
+
+Flat. RWKV-7's decay is per-channel and many channels sit at `w ≈ 1`, so
+document identity is not washed out by the tail — it stops changing after a few
+tokens and stays. (A *randomly initialised* model behaves very differently:
+`w ≈ 0.74` uniformly, and the document is gone within twenty tokens. That is a
+property of untrained weights, not of the architecture — relevant only if you
+write tests against a toy base, see `tools/test_reranker_smoke.py`.)
+
+---
+
+## Anatomy of the head
+
+```
+probe token(s)  ──▶ ln0 ──▶ RWKV block 0 ──▶ … ──▶ RWKV block n-1 ──▶ ln_out ──▶ Linear ─ tanh ─ Linear ──▶ scalar
+                              ▲                        ▲
+                    h_in = base state of          h_in = base state of
+                        layer_idx[0]                 layer_idx[n-1]
+```
+
+- **Probe tokens** are learnable embeddings, not vocabulary tokens. Their scale
+  does not matter — `ln0` normalises each token.
+- **Blocks** are ordinary `RWKVBlock`s from the x070 architecture, initialised
+  from the base's blocks at `layer_idx`. They are the same code path used in
+  the base model, so no separate kernel or numerics.
+- Because a block runs on a single token, the WKV recurrence takes the
+  `wkv7_step` path — plain MLX ops rather than the Metal checkpoint kernel,
+  which needs `T` to be a multiple of 16. Same math, 16× less work, autograd
+  for free.
+- The final `Linear` is **zero-initialised**: before training all scores are
+  exactly `0`, so the listwise loss starts at exactly `ln(C)`. If your first
+  logged loss is not `ln(C)`, the data or the head is wired wrong — that is the
+  cheapest bug detector in the pipeline.
+
+The head is a **sibling** of the base, never a submodule of it. `base.freeze()`
+(and `add_lora` / `quantize_base_model`, which call `freeze()` internally)
+would silently freeze the head if it lived inside that tree.
+
+Parameter count: one block at `D=768` is ~7.5 M, plus ~0.6 M for the MLP. So a
+one-layer head is ~8.1 M trainable parameters, a two-layer head ~15.6 M.
+
+---
+
+## `RerankerConfig`: every switch
+
+```python
+from rwkv_metal.reranker import Reranker, RerankerConfig
+
+model = Reranker(base, RerankerConfig(
+    layer_idx    = (5, 11),
+    shared_state = False,
+    n_probe      = 1,
+    head_hidden  = None,
+))
+```
+
+| Field | Default | What it does |
+|---|---|---|
+| `layer_idx` | `(-1,)` | Which base layers the head reads. One block per index; negative indices count from the end. More layers = more signal from different depths, more parameters, and a proportionally bigger state cache. |
+| `shared_state` | `False` | Every block reads the **last** layer's state while the stack keeps its depth. A way to make the head deeper without making it read more layers (and without growing the cache). |
+| `n_probe` | `1` | Number of probe tokens. Each is another read of the state; the score comes from the last one. |
+| `head_hidden` | `n_embd` | Hidden width of the scoring MLP. |
+
+`Reranker(base, cfg, freeze_base=True, init_from_base=True)` — the two extra
+flags exist for experiments (training the base too, or starting the head from
+random weights). Both defaults are what you want.
+
+### Choosing layers
+
+The last layer is not automatically the best source. The state of layer 11 in
+the 0.1B model is dominated by a large component shared across all documents
+(cos between unrelated documents ≈ 0.996), while middle layers carry
+proportionally more document-specific variation (layer 5 ≈ 0.955, layer 0 ≈
+0.918). Measured effect on held-out MRR is in [Measured results](#measured-results);
+the short version is that a middle layer beats the last one and combining
+layers beats either.
+
+Compare configurations cheaply by caching a superset of layers once and slicing
+it per configuration — `tools/run_reranker.py --cache_layers 0,5,11 --configs
+-1 5 0,5,11` does exactly this.
+
+---
+
+## The state cache: why training is cheap
+
+With the base frozen, "pair text → state" is a fixed function. So it does not
+belong inside the training loop:
+
+1. **Encode once.** `encode_pairs` folds every `(document, query)` pair into a
+   state, reusing the document prefix across all queries that share it.
+2. **Keep only what the head reads.** `RerankerHead.unique_sources` — one layer
+   out of twelve by default: 98 KB per pair in bf16 versus 2.4 MB for a full
+   fp32 state, 25× less.
+3. **Train on the cache.** A step touches only the head: one or two RWKV blocks
+   on a single token. An epoch over tens of thousands of pairs takes seconds.
+
+```python
+from rwkv_metal.reranker import encode_pairs, build_candidates, load_rows
+
+rows = load_rows("train.jsonl", task="retrieval", limit=1000)
+pool, samples = build_candidates(rows, n_candidates=8)
+cache = encode_pairs(model, tok, pool, samples,
+                     max_doc_tokens=512, max_query_tokens=96)
+cache.save("cache.safetensors")
+```
+
+Measured on an M4 Air, 0.1B base, 1000 queries × 8 candidates:
+
+| | |
+|---|---|
+| unique document prefixes | 1986 out of 8000 pairs (75 % saved by dedup) |
+| encoding | ~7 min, once |
+| cache size | 2.36 GB (3 layers, bf16) |
+| training | seconds per epoch |
+
+Practical consequence: hyperparameter search, layer ablations and long
+schedules become free. The expensive part runs once and is reused via
+`--cache_path`.
+
+The catch: the cache is only valid for that base, template, truncation and
+candidate set. Change any of them and it must be rebuilt — `run_reranker.py`
+checks shape compatibility and refuses to load a mismatched cache, but it
+cannot detect a changed base checkpoint. Name your cache files accordingly.
+
+---
+
+## Data and candidates
+
+Input format is the LitRetrieval-style jsonl used by the embedding side:
+
+```json
+{"anchor": "Instruct: ...\nQuery: ...", "positive": "...", "negative": "...", "task": "retrieval"}
+```
+
+```python
+pool, samples = build_candidates(rows, n_candidates=8, seed=0)
+```
+
+Each sample gets:
+
+1. its **positive**,
+2. its **hard negative** (already mined in the dataset),
+3. the rest sampled from the shared document pool.
+
+The pool is deduplicated, so a document appearing under several queries is
+encoded once — which is what makes extra candidates nearly free. The position
+of the positive is **shuffled**; with a listwise loss, a fixed position is a
+shortcut the head will happily learn instead of the task.
+
+`load_rows` streams the file with reservoir sampling (Algorithm R), so a 2.6 GB
+/ 554 k-row source never lands in memory — `limit` rows do, and they are a fair
+uniform sample rather than "the first N".
+
+`split_train_eval(samples, n_eval)` splits by **query**. Documents are shared
+across the split on purpose: what is being measured is ranking, not memorising
+which documents exist.
+
+---
+
+## Losses
+
+```python
+from rwkv_metal.reranker import listwise_loss, bce_loss, mixed_loss
+```
+
+| Loss | What it optimises | When |
+|---|---|---|
+| `listwise_loss` | softmax cross-entropy over the candidate list | **default.** Optimises the ordering, which is what the metrics measure |
+| `bce_loss` | per-candidate binary cross-entropy (positive → 1, rest → 0) | the original EmbeddingRWKV recipe; calibrates the absolute level of the scores |
+| `mixed_loss(α)` | `α · listwise + (1-α) · BCE` | use `α < 1` if you need scores comparable **across** queries (thresholding, score fusion) |
+
+`RerankTrainConfig.loss_alpha` selects this; `1.0` (pure listwise) is the
+default.
+
+Absolute-score calibration is the only reason to keep a pointwise term. If you
+only ever sort candidates within one query, pure listwise is strictly better.
+
+---
+
+## `RerankTrainConfig`: every switch
+
+```python
+from rwkv_metal.reranker import RerankTrainConfig, train_reranker
+
+res = train_reranker(model, train_cache, eval_cache, RerankTrainConfig(
+    lr=2e-4, batch_size=32, epochs=8,
+))
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `lr` | `3e-5` | Conservative. The head is small and trained from scratch on a frozen feature map, so it tolerates much more — `1e-4`–`3e-4` is a reasonable range. Watch the first epochs: if the loss barely moves, raise it. |
+| `weight_decay` | `0.01` | AdamW. The head is the only thing that can overfit here. |
+| `grad_clip` | `1.0` | |
+| `batch_size` | `32` | **queries** per step; pairs per step is `batch_size × n_cand`. Steps are cheap — the limit is state memory, not compute. |
+| `epochs` | `4` | Cheap. Combine with `keep_best`. |
+| `warmup_frac` | `0.05` | Fraction of total steps spent warming up. |
+| `lr_schedule` | `"cosine"` | `cosine` / `linear` / `constant`. |
+| `loss_alpha` | `1.0` | See [Losses](#losses). |
+| `temperature` | `1.0` | Divides the logits in the listwise loss. |
+| `eval_every` | `0` | Steps between held-out evaluations; `0` = once per epoch. |
+| `keep_best` | `True` | Restore the weights of the best held-out epoch at the end instead of the last. |
+| `checkpoint_path` | `reranker_head.safetensors` | Only the head is saved — the base is unchanged by definition. |
+
+---
+
+## Evaluation
+
+```python
+from rwkv_metal.reranker import evaluate
+m = evaluate(model.head, eval_cache)
+# {"mrr": ..., "recall@1": ..., "recall@3": ..., "recall@5": ..., "ndcg@10": ..., "loss": ...}
+```
+
+Ranks use **average tie-breaking**: `1 + (strictly greater) + (ties − 1)/2`.
+This matters more than it sounds. An untrained zero-initialised head gives every
+candidate the same score; with optimistic tie-breaking that scores a perfect
+MRR of 1.0, and the "before" column of every table becomes a lie. With average
+ties it reports `2/(C+1)` — exactly random guessing, which is the truth.
+
+That same number is the floor to compare against: `0.222` for 8 candidates.
+The more informative baseline is the **embedder on the same frozen base and the
+same candidate sets** — it isolates what the head adds, with the base held
+constant. `tools/run_reranker.py` reports both.
+
+---
+
+## Full runs
+
+```bash
+.venv/bin/python tools/run_reranker.py \
+    --model ~/Develop/WKV-kvant/rwkv7-g1d-0.1b.pth \
+    --data  ~/Develop/retrieval_literature/train.jsonl \
+    --queries 1000 --candidates 8 --eval_queries 150 \
+    --max_doc_tokens 512 \
+    --cache_layers 0,5,11 --configs -1 5 0,5,11 \
+    --epochs 8 --batch_size 32 --lr 2e-4 \
+    --cache_path runs/reranker_0.1b/cache.safetensors \
+    --out runs/reranker_0.1b
+```
+
+The runner reads data, builds candidates, computes the random and embedder
+baselines, encodes the state cache once, then trains every requested layer
+configuration from that one cache. Everything — config, per-step losses,
+before/after metrics, timings, peak memory — is written to `report.json` after
+each stage, so a run is inspectable while it is still going and survives being
+killed.
+
+Re-running with the same `--cache_path` skips encoding entirely, which is what
+makes hyperparameter search practical.
+
+---
+
+## Measured results
+
+0.1B World base (`rwkv7-g1d-0.1b`), LitRetrieval `retrieval` task, 1000 queries
+× 8 candidates (its positive, its mined hard negative, six sampled from the
+pool), 150 held-out queries, documents truncated at 512 tokens, 8 epochs,
+`lr=2e-4`, listwise loss. M4 Air, 8 GPU cores, 16 GB.
+
+| | MRR | R@1 | nDCG@10 | vs hard neg | vs sampled neg |
+|---|---|---|---|---|---|
+| random guessing | 0.222 | 0.125 | — | 0.500 | 0.500 |
+| embedder on the same frozen base | 0.491 | 0.253 | 0.615 | **0.493** | 0.749 |
+| reranker, last layer `(-1,)` | 0.907 | 0.847 | 0.930 | 0.900 | 0.967 |
+| reranker, middle layer `(5,)` | 0.970 | 0.940 | 0.978 | 0.947 | 0.999 |
+| reranker, `(0, 5, 11)` | **0.977** | **0.953** | **0.983** | **0.960** | 0.999 |
+
+The last two columns are the ones that matter. Overall MRR flatters everyone:
+telling a passage about beekeeping from a passage about steam engines is easy,
+and six of eight candidates are that kind of negative. Split it apart and:
+
+- the raw embedder is at **chance** (0.493) against the mined hard negative — it
+  separates topics, not relevance;
+- the reranker gets 0.96 on exactly that comparison, while being essentially
+  perfect (0.999) on the easy one.
+
+That gap is what a reranker is for. Both stages use the **same frozen base** —
+the difference is entirely what the head does with the state.
+
+Layer choice matters more than head depth: a middle layer beats the last layer
+by ~0.06 MRR and ~0.05 on hard negatives. Consistent with the state geometry —
+layer 11's state is dominated by a component shared across all documents
+(cos ≈ 0.996 between unrelated documents), so the discriminative part is a
+smaller fraction of it.
+
+Cost, end to end:
+
+| stage | time |
+|---|---|
+| encoding 8000 pairs (1986 unique prefixes) into a 2.36 GB bf16 cache | 5.5 min, once |
+| training one head configuration, 8 epochs | 10–31 s |
+| embedder baseline (917 documents + 150 queries) | 1.7 min |
+| **total for three head configurations** | **8.1 min**, peak 6.8 GB |
+
+Re-running from a saved cache: **2.7 min**, almost all of it the embedder
+baseline.
+
+Run-to-run spread with the same flags is about ±0.03 MRR (head initialisation);
+`--seed` fixes it. The ordering between layer configurations held across runs.
+
+### Caveats
+
+- One dataset, one language mix, one base size. LitRetrieval is literary
+  Russian/English prose; nothing here says how this transfers to code, chat logs
+  or short-form web text.
+- Hard negatives come from whatever miner built the dataset. "0.96 against hard
+  negatives" is against *those* negatives.
+- 850 training queries is small. The numbers should be read as "the head learns
+  the task quickly and cheaply", not as a quality ceiling.
+
+---
+
+## Model-level state API
+
+The reranker is built on a general state API added to `RWKV7X070`. It is useful
+on its own — streaming inference, prefix caching, state tuning:
+
+```python
+h, state = model.body(idx, return_state=True)     # RWKVState
+h2, state2 = model.body(idx2, state=state, return_state=True)   # continue
+state = model.states(idx, mask=mask, end_idx=end_idx)           # state only
+```
+
+`RWKVState` carries three things per layer: the WKV matrix, and the token-shift
+inputs of `tmix` and `cmix`. The last two are easy to forget and produce a
+continuation that differs from a straight pass on the first token of every
+layer. `v_first` is deliberately **not** in the state — in x070 it is recomputed
+per position by layer 0, not carried.
+
+### Right padding is exact
+
+Batching sequences of different lengths normally corrupts the final state,
+which is why the original implementation left-pads. Here padded positions are
+made **neutral** for the recurrence — `w ← 1`, `k ← 0`, `b ← 0`, so
+`h_next = 1·h + v·0ᵀ + sa·0ᵀ = h`. The state freezes at the row's last real
+token and does not depend on padding or on batch neighbours.
+
+Pass `mask` (1 for real tokens) and `end_idx` (position of each row's last real
+token) — `rwkv_metal.model.build_mask(lengths, T)` builds the mask.
+
+Verified in `tests/test_wkv7_state.py`: a ragged padded batch reproduces
+individual unpadded passes, and a split pass (document, then query from its
+state) reproduces the full pass.
+
+### Not available on `RWKV7`
+
+The from-scratch pretraining architecture (`rwkv_metal.model.RWKV7`) carries
+token-shift **between blocks**: block `i+1` receives block `i`'s last output as
+its "previous token". That token is in the future relative to position 0, so a
+continuation that matches a straight pass cannot be defined — the value needed
+at the boundary depends on tokens that have not arrived. `RWKV7.body` raises
+`NotImplementedError` for state arguments rather than returning something that
+looks right.
+
+This is worth knowing independently of the reranker: it means the from-scratch
+architecture leaks future information during training. Changing only the last
+token of an input changes hidden states at positions `0..T-2` (measured
+`max|Δh| = 0.30`; the same test on x070 gives exactly `0.0`).
+
+---
+
+## Practical advice
+
+- **Two-stage or nothing.** A cross-encoder scores one pair at a time. Use the
+  embedder to shortlist, then rerank the top 20–100. Reranking a corpus is not
+  a thing you do.
+- **Read the first loss value.** Zero-init means it must be exactly `ln(C)`.
+- **Raise the learning rate.** `3e-5` is a fine-tuning default and is too low
+  for a head trained from scratch on frozen features.
+- **Truncate documents deliberately.** `max_doc_tokens` truncates the **tail**.
+  LitRetrieval passages are ~530 tokens median, so `512` keeps almost all of
+  them; smaller values buy encoding speed at a measurable cost.
+- **Watch the candidate count.** More candidates make the listwise loss harder
+  and the metric stricter. Comparing MRR across different `n_candidates` is
+  meaningless — the random floor moves.
+- **The index is per-instruction.** Change the instruction string and the cached
+  prefixes are wrong. There is no checksum guarding this.
+
+---
+
+## Differences from EmbeddingRWKV
+
+| | EmbeddingRWKV | here |
+|---|---|---|
+| Padding | left, padding runs through the recurrence | right, padded positions are exact no-ops |
+| State read at | end of the padded row | last real token (`end_idx`) |
+| Loss | pointwise BCE | listwise softmax (BCE available, mixable) |
+| Training cost | full base forward every step | states cached once, head trained on the cache |
+| Negatives | easy/medium/hard sampling per row | shared deduplicated document pool, so extra candidates cost only the query tail |
+| Head init | last layer of the score MLP randomly initialised | zero-init, so the starting loss is exactly `ln(C)` |
+| Probe tokens | 1 | `n_probe`, configurable |
+
+---
+
+## Current limitations
+
+- **Base is frozen, full stop.** There is no LoRA-on-the-base path for the
+  reranker yet. It would break the state cache during training (the feature map
+  would move every step), so it needs the online-encoding trainer that does not
+  exist yet.
+- **No multi-task heads.** One scalar score, one task. The instruction string is
+  the only task conditioning.
+- **The index is memory-hungry.** 2.4 MB per document at 0.1B, fp32. bf16 via
+  `build_index(..., dtype=mx.bfloat16)` halves it; the WKV part stays fp32
+  because continuation accuracy depends on it.
+- **Fixed per-call overhead.** A forward pass costs ~14 ms of fixed overhead at
+  `B=1` (twelve layers of Python and kernel launches) before any real work.
+  Short-query indexed scoring is dominated by it. `mx.compile` over the head
+  and the continuation path is the obvious next optimisation.
+- **No cross-encoder distillation.** Training a reranker from a stronger
+  teacher's scores is the standard way to get a good one; only the
+  positive/negative signal from the dataset is used here.
+
+See also: [`embedding.md`](./embedding.md) for the first-stage retriever,
+[`inference.md`](./inference.md) for serving, [`lora.md`](./lora.md) for
+fine-tuning the base itself.

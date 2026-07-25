@@ -20,6 +20,8 @@ WKV-7 ядро на Metal: forward / backward (checkpoint) / inference.
 from .wkv7 import (
     wkv7,
     wkv7_train,
+    wkv7_train_with_state,
+    wkv7_step,
     wkv7_infer,
     wkv7_train_py,
     wkv7_train_py_with_state,
@@ -34,6 +36,8 @@ from .wkv7_checkpoint import (
 __all__ = [
     "wkv7",
     "wkv7_train",
+    "wkv7_train_with_state",
+    "wkv7_step",
     "wkv7_infer",
     "wkv7_train_py",
     "wkv7_train_py_with_state",

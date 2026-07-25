@@ -6,9 +6,11 @@ checkpoint produced by [`rwkv-quant`](https://github.com/impulseleap/rwkv-quant)
 
 - [Concepts](#concepts)
 - [bf16 inference](#bf16-inference)
+- [Streaming decode with state](#streaming-decode-with-state)
 - [Quantized inference (`.rwkvq`)](#quantized-inference-rwkvq)
 - [Choosing bf16 vs quantized](#choosing-bf16-vs-quantized)
 - [Embedding RWKV: extracting vectors](#embedding-rwkv-extracting-vectors)
+- [Reranking: scoring query–document pairs](#reranking-scoring-querydocument-pairs)
 - [Current limitations](#current-limitations)
 
 ---
@@ -96,11 +98,75 @@ print(tok.decode(generated[len(ids):]))
 ```
 
 > **Cost note.** This loop re-runs the *entire* growing context through every
-> block on each new token (no state is carried between steps), so per-token
-> cost grows with sequence length — fine for short completions, wasteful for
-> long ones. See [Current limitations](#current-limitations) below: the WKV-7
-> kernel already has a stateful, O(1)-per-token primitive (`wkv7_infer`), it is
-> just not yet wired into `RWKV7X070`/`RWKV7` as a `model.generate()`-style API.
+> block on each new token, so per-token cost grows with sequence length. Carry
+> the state instead — see the next section.
+
+---
+
+## Streaming decode with state
+
+`RWKV7X070` threads its full recurrent state through `body()`, so each new token
+costs the same regardless of how much context precedes it:
+
+```python
+import mlx.core as mx
+import rwkv_metal as rk
+
+model, cfg = rk.load_pretrained("weights/RWKV-x070-World-0.1B.pth")
+tok = rk.WorldTokenizer()
+
+ids = tok.encode("User: What is the capital of France?\n\nAssistant:")
+
+# fold the prompt into a state, once
+h, state = model.body(mx.array(ids)[None, :], return_state=True)
+logits = model.head(h[:, -1])
+
+generated = []
+for _ in range(200):
+    next_id = sample(logits[0], temperature=0.8, top_p=0.9)
+    generated.append(next_id)
+    if next_id == 0:
+        break
+    h, state = model.body(mx.array([[next_id]]), state=state, return_state=True)
+    logits = model.head(h[:, -1])
+
+print(tok.decode(generated))
+```
+
+`state` is an `RWKVState`: the WKV matrix per layer plus the token-shift inputs
+of `tmix` and `cmix`. All three are needed — carrying only the WKV matrix
+produces a continuation that differs from a straight pass on the first token of
+every layer.
+
+A single-token step takes the `wkv7_step` path (plain MLX ops) rather than the
+Metal checkpoint kernel, which requires `T` to be a multiple of 16 and would
+otherwise do sixteen steps' worth of work for one token.
+
+### Batching sequences of different lengths
+
+Padding normally corrupts the final state, since padded tokens run through the
+recurrence like any other. Pass a mask and padded positions become exact
+no-ops (`w ← 1`, `k ← 0`, `b ← 0`, so `h_next = h`):
+
+```python
+from rwkv_metal.model import build_mask
+
+lengths = [41, 17, 8]
+idx = ...                                    # [3, 41], right-padded with 0
+mask = build_mask(lengths, idx.shape[1])     # [3, 41]
+end_idx = mx.array([L - 1 for L in lengths])
+
+state = model.states(idx, mask=mask, end_idx=end_idx)
+```
+
+Each row's state freezes at its last real token, independent of padding and of
+batch neighbours. Verified against individual unpadded passes in
+`tests/test_wkv7_state.py`.
+
+> Not available on `RWKV7` (the from-scratch pretraining architecture): it
+> carries token-shift between blocks, which makes an exact continuation
+> impossible to define. `RWKV7.body` raises `NotImplementedError` for state
+> arguments — details in [`reranker.md`](./reranker.md#not-available-on-rwkv7).
 
 ---
 
@@ -241,18 +307,106 @@ building the negative pool are all in **[`embedding.md`](./embedding.md)**.
 
 ---
 
+## Reranking: scoring query–document pairs
+
+An embedder scores a query and a document separately — it never sees them
+together. A **reranker** does: it reads the pair jointly and produces one
+relevance score. That is much more accurate and much more expensive, so it runs
+as a second stage over the handful of candidates the embedder shortlisted.
+
+```python
+import rwkv_metal as rk
+from rwkv_metal.reranker import Reranker, RerankerInference
+
+base, cfg = rk.load_pretrained("weights/rwkv7-g1d-0.1b.pth")
+model = Reranker(base)                          # base frozen automatically
+model.load_head("reranker_head.safetensors")    # trained scoring head
+
+rr = RerankerInference(model, rk.WorldTokenizer())
+
+query = "how do bees overwinter?"
+docs = [...]                                     # top-k from your embedder
+
+for doc_id, score in rr.rank(query, docs, top_k=5):
+    print(f"{score:+.2f}  {docs[doc_id][:80]}")
+```
+
+`rank` returns `(index, score)` pairs sorted by descending score; `score`
+returns the raw array in input order. Scores are logits — comparable **within**
+one query, not across queries (unless the head was trained with a pointwise
+term; see [`reranker.md`](./reranker.md#losses)).
+
+### The two-stage pipeline
+
+```python
+from rwkv_metal.embedding import Embedder, cosine_similarity_matrix
+
+emb = Embedder(base, tok)
+corpus_vecs = emb(corpus)                        # once, offline
+q_vec = emb(query)
+
+sims = (q_vec @ corpus_vecs.T)[0]
+shortlist = [int(i) for i in mx.argsort(-sims)[:50].tolist()]
+
+ranked = rr.rank(query, [corpus[i] for i in shortlist], top_k=10)
+final = [(shortlist[i], s) for i, s in ranked]
+```
+
+Both stages share the same frozen base, so only one set of weights is loaded.
+
+### Serving the same documents repeatedly
+
+The template puts the document **before** the query, which makes
+`Instruct: … \nDocument: {doc}\n` a cacheable prefix. Precompute it:
+
+```python
+index = rr.build_index(docs)                     # encode prefixes once
+scores = rr.score_indexed(query, index)          # each query pays only its own tokens
+ranked = rr.rank_indexed(query, index, top_k=5)
+```
+
+Measured on a 0.1B base, M4 Air: **73 ms per pair without the index, 3.5 ms with
+it** — about 20×. The price is memory: a full state is
+`n_layer · n_head · 64 · 64 · 4` bytes, ~2.4 MB per document at 0.1B (halve it
+with `build_index(..., dtype=mx.bfloat16)`). An index of a thousand documents is
+2.4 GB, so build it for a hot subset, not a corpus.
+
+An index is bound to the base, the template and the instruction string it was
+built with — the state is a function of exactly that prefix, and nothing checks
+this for you.
+
+### Knobs
+
+```python
+rr = RerankerInference(model, tok,
+    instruct="Given a search query, retrieve relevant passages that answer the query",
+    max_doc_tokens=512,      # documents are truncated at the tail
+    max_query_tokens=96,
+)
+```
+
+`instruct` can also be passed per call (`rr.rank(query, docs, instruct=...)`),
+but it must match what the head was trained with, and what an index was built
+with.
+
+Training your own head, choosing which base layers it reads, and the measured
+numbers are all in **[`reranker.md`](./reranker.md)**.
+
+---
+
 ## Current limitations
 
-- **No `model.generate()`.** You assemble the loop yourself (see above). The
-  loop re-runs the full context each step; there is no built-in KV/state
-  cache at the model level yet.
-- **No stateful streaming decode wired up.** The Metal WKV-7 kernel has a
-  stateful, step-by-step primitive (`rwkv_metal.wkv7_infer(r, w, k, v, a, b,
-  state) -> (out, new_state)`, O(1) per token) and it is unit-tested
-  (`tests/test_wkv7_infer_var.py`), but `RWKV7X070`/`RWKV7` don't expose a
-  path that threads that state through token-shift and `v_first` across
-  blocks. Wiring this up would turn the naive loop above into real streaming
-  inference — a good contribution if you want to take it on.
+- **No `model.generate()`.** You assemble the loop yourself (see
+  [Streaming decode with state](#streaming-decode-with-state)). The state
+  plumbing exists; the convenience wrapper, sampler and stop-condition handling
+  do not.
+- **Per-step overhead dominates short steps.** A single-token step costs ~14 ms
+  at `B=1` on a 0.1B model, almost all of it fixed cost — twelve layers of
+  Python dispatch and kernel launches, not arithmetic. Batch your decode or
+  wrap the step in `mx.compile` if throughput matters.
+- **State plumbing is x070-only.** `RWKV7` (from-scratch pretraining
+  architecture) cannot support it — see
+  [`reranker.md`](./reranker.md#not-available-on-rwkv7).
 - **`emb.weight` is never quantized**, even in the `.rwkvq` path — embedding
   lookup is a gather, not a matmul, so it stays bf16 regardless of preset.
 - **`merge_lora()` doesn't apply to `.rwkvq`-based adapters.** It writes the

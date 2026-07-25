@@ -13,7 +13,7 @@ wkv7.py — публичный слой WKV-7 ядра (forward / backward / inf
 """
 import mlx.core as mx
 
-from .wkv7_checkpoint import make_wkv7_checkpoint
+from .wkv7_checkpoint import make_wkv7_checkpoint, make_wkv7_checkpoint_with_state
 
 HEAD_SIZE = 64
 CHUNK     = 16
@@ -243,18 +243,29 @@ def _wkv7_chunk_metal_vjp(primals, cotangents, outputs):
 # Checkpoint kernel: один fwd + один bwd вызов на весь T
 # 1.73× быстрее chunked v2, численно точнее (stable reconstruction per chunk)
 _ckpt_cache: dict = {}
+_ckpt_state_cache: dict = {}
+
+
+def _pad_to_chunk(r, w, k, v, a, b):
+    """Дополняет T до кратного CHUNK так, чтобы добавленные шаги были no-op.
+
+    w=1, k=v=a=b=0  =>  h_next = 1*h + v*kᵀ + sa*bᵀ = h. Состояние на выходе
+    не меняется, поэтому h_out после паддинга равен h_out без него.
+    """
+    T = r.shape[1]
+    if T % CHUNK == 0:
+        return r, w, k, v, a, b, T
+    pad = CHUNK - (T % CHUNK)
+
+    def p(x, val=0.0):
+        return mx.pad(x, [(0, 0), (0, pad), (0, 0), (0, 0)], constant_values=val)
+
+    return p(r), p(w, 1.0), p(k), p(v), p(a), p(b), T + pad
+
 
 def wkv7_train(r, w, k, v, a, b):
     B, T, H, D = r.shape
-    # T должно делиться на CHUNK=16; паддинг если нет
-    if T % CHUNK != 0:
-        pad = CHUNK - (T % CHUNK)
-        def p(x, val=0.0):
-            return mx.pad(x,[(0,0),(0,pad),(0,0),(0,0)],constant_values=val)
-        r=p(r);w=p(w,1.0);k=p(k);v=p(v);a=p(a);b=p(b)
-        T_pad = T + pad
-    else:
-        T_pad = T
+    r, w, k, v, a, b, T_pad = _pad_to_chunk(r, w, k, v, a, b)
 
     key = (B, T_pad, H, D)
     if key not in _ckpt_cache:
@@ -262,6 +273,55 @@ def wkv7_train(r, w, k, v, a, b):
 
     out = _ckpt_cache[key](r, w, k, v, a, b)
     return out[:, :T]
+
+
+def wkv7_train_with_state(r, w, k, v, a, b, h_in=None):
+    """Как wkv7_train, но с явным начальным состоянием и возвратом конечного.
+
+    h_in: [B, H, D, D] или None (нулевое состояние).
+    Возвращает (out [B,T,H,D], h_out [B,H,D,D]).
+
+    Дифференцируемо по h_in тоже — VJP ядра отдаёт dh_in, что и позволяет
+    учить поверх состояния (реранкер) или тюнить само состояние.
+    """
+    B, T, H, D = r.shape
+    if h_in is None:
+        h_in = mx.zeros((B, H, D, D), dtype=mx.float32)
+    r, w, k, v, a, b, T_pad = _pad_to_chunk(r, w, k, v, a, b)
+
+    key = (B, T_pad, H, D)
+    if key not in _ckpt_state_cache:
+        _ckpt_state_cache[key] = make_wkv7_checkpoint_with_state(B, T_pad, H, D)
+
+    out, h_out = _ckpt_state_cache[key](r, w, k, v, a, b, h_in)
+    return out[:, :T], h_out
+
+
+def wkv7_step(r, w, k, v, a, b, h_in):
+    """Один шаг рекуррентности на чистых MLX-операциях (T == 1).
+
+    Ядро-checkpoint требует T кратного CHUNK=16, то есть один токен стоил бы
+    16 шагов. Реранкер прогоняет ровно один обучаемый токен на блок, поэтому
+    здесь дешевле и точнее развернуть шаг в обычные операции: autograd MLX
+    даёт градиенты и по параметрам, и по h_in без отдельного backward-ядра.
+
+    r..b: [B, 1, H, D] (либо [B, H, D]). h_in: [B, H, D, D] (h[s, d]).
+    Возвращает (out [B, 1, H, D], h_out [B, H, D, D]).
+    """
+    squeeze = (r.ndim == 4)
+    if squeeze:
+        r, w, k, v, a, b = (x[:, 0] for x in (r, w, k, v, a, b))
+    h = h_in.astype(mx.float32)
+    r, w, k, v, a, b = (x.astype(mx.float32) for x in (r, w, k, v, a, b))
+    # sa[s] = sum_d h[s,d] * a[d]
+    sa = (h * a[:, :, None, :]).sum(axis=-1)                      # [B,H,D]
+    h = (h * w[:, :, None, :]
+         + v[:, :, :, None] * k[:, :, None, :]
+         + sa[:, :, :, None] * b[:, :, None, :])
+    out = (h * r[:, :, None, :]).sum(axis=-1)                     # [B,H,D]
+    if squeeze:
+        out = out[:, None]
+    return out, h
 
 # ─────────────────── Inference: Metal kernel ────────────────────────────────
 
@@ -326,8 +386,15 @@ def wkv7_infer(r, w, k, v, a, b, h):
 
 # ─────────────────── Публичный API ──────────────────────────────────────────
 
-def wkv7(r, w, k, v, a, b, training=True, state=None):
-    if training:
-        return wkv7_train(r, w, k, v, a, b), None
-    else:
+def wkv7(r, w, k, v, a, b, training=True, state=None, return_state=False):
+    """Единая точка входа.
+
+    training=True, state=None, return_state=False  → (out, None), h0 = 0
+    training=True, state и/или return_state        → (out, h_out), дифференцируемо по state
+    training=False                                  → (out, h_out) на inference-ядре
+    """
+    if not training:
         return wkv7_infer(r, w, k, v, a, b, state)
+    if state is None and not return_state:
+        return wkv7_train(r, w, k, v, a, b), None
+    return wkv7_train_with_state(r, w, k, v, a, b, state)

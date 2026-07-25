@@ -27,7 +27,7 @@ wandb = ["wandb"]
 dev = ["pytest"]
 
 [project.urls]
-Homepage = "https://impulseleap.com"
+Homepage = "https://www.impulseleap.com"
 
 [project.scripts]
 rwkv-metal-pretrain = "rwkv_metal.pretrain.cli:main"

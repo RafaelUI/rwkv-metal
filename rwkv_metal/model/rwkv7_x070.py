@@ -20,7 +20,8 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.utils import checkpoint as _nn_checkpoint
-from ..kernel.wkv7 import wkv7
+from ..kernel.wkv7 import wkv7, wkv7_step
+from .state import RWKVState, gather_last
 
 
 def l2_norm(x):
@@ -85,7 +86,21 @@ class RWKV_Tmix_x070(nn.Module):
         # GroupNorm по головам (как официальный F.group_norm(num_groups=H, eps=64e-5))
         self.ln_x = nn.GroupNorm(H, D, eps=64e-5, affine=True, pytorch_compatible=True)
 
-    def __call__(self, x, v_first, x_prev=None):
+    def __call__(self, x, v_first, x_prev=None, h_in=None, mask=None,
+                 return_state=False):
+        """mask: [B, T] (1 — реальный токен, 0 — паддинг) либо None.
+
+        Пад-позиции делаются НЕЙТРАЛЬНЫМИ для рекуррентности: w←1, k←0, b←0,
+        откуда h_next = 1·h + v·0ᵀ + sa·0ᵀ = h. Это точное решение проблемы
+        right-padding'а: состояние строки замирает на её последнем реальном
+        токене и не зависит ни от числа пад-токенов, ни от соседей по батчу.
+        (Оригинальный EmbeddingRWKV вместо этого паддит слева и мирится с тем,
+        что пад-токены всё же проходят через рекуррентность.)
+
+        Выход на пад-позициях остаётся мусорным, но модель каузальна: он может
+        попасть только на пад-позиции следующих слоёв, до реальных токенов не
+        доходит.
+        """
         B, T, D = x.shape
         H, S = self.H, self.S
 
@@ -122,7 +137,27 @@ class RWKV_Tmix_x070(nn.Module):
             v = v + (v_first - v) * vv
 
         # WKV-7: a_kernel = -kk, b_kernel = kk * a
-        out, _ = wkv7(r, w, k, v, -kk, kk * a, training=True)  # (B,T,H,S)
+        k_wkv, b_wkv = k, kk * a
+        if mask is not None:
+            m = mask.reshape(B, T, 1, 1).astype(w.dtype)
+            w = w * m + (1.0 - m)   # w=1 на паддинге → состояние не затухает
+            k_wkv = k_wkv * m       # обнуляет v·kᵀ
+            b_wkv = b_wkv * m       # обнуляет sa·bᵀ
+
+        if T == 1:
+            # Checkpoint-ядро требует T кратного 16, то есть один токен стоил
+            # бы 16 шагов. Разворачиваем шаг в обычные MLX-операции: та же
+            # математика, autograd бесплатно, в 16 раз меньше работы. Это путь
+            # реранкера (один токен-зонд поверх состояния) и пошагового
+            # инференса.
+            if h_in is None:
+                h_in = mx.zeros((B, H, S, S), dtype=mx.float32)
+            out, h_out = wkv7_step(r, w, k_wkv, v, -kk, b_wkv, h_in)
+        elif return_state or h_in is not None:
+            out, h_out = wkv7(r, w, k_wkv, v, -kk, b_wkv, training=True,
+                              state=h_in, return_state=True)
+        else:
+            out, h_out = wkv7(r, w, k_wkv, v, -kk, b_wkv, training=True)
 
         # Порядок официала: ln_x (GroupNorm) ДО bonus
         # ln_x per-token: канон RWKV-7 — F.group_norm(x.view(B*T, C), H).
@@ -132,7 +167,10 @@ class RWKV_Tmix_x070(nn.Module):
         bonus = (r * k * self.r_k).sum(axis=-1, keepdims=True) * v
         out = (out + bonus).reshape(B, T, D)
 
-        return self.o_proj(out * g), v_first
+        y = self.o_proj(out * g)
+        if return_state:
+            return y, v_first, h_out
+        return y, v_first
 
 
 class RWKV_CMix_x070(nn.Module):
@@ -157,10 +195,27 @@ class RWKVBlock(nn.Module):
         self.tmix = RWKV_Tmix_x070(config, layer_id, ranks)
         self.cmix = RWKV_CMix_x070(config)
 
-    def __call__(self, x, v_first):
-        h, v_first = self.tmix(self.ln1(x), v_first)   # без межблочного x_prev
+    def __call__(self, x, v_first, h_in=None, mask=None, tmix_prev=None,
+                 cmix_prev=None, end_idx=None, return_state=False):
+        """Быстрый путь (без состояния) — ровно как раньше: token-shift
+        стартует с нуля в каждом блоке, межблочного переноса нет.
+
+        Путь с состоянием возвращает (x, v_first, h_out, tmix_shift, cmix_shift),
+        где сдвиги сняты с позиции end_idx (или последней, если end_idx=None) —
+        именно они нужны, чтобы продолжение совпало со сплошным проходом.
+        """
+        x1 = self.ln1(x)
+        if return_state:
+            h, v_first, h_out = self.tmix(x1, v_first, x_prev=tmix_prev,
+                                          h_in=h_in, mask=mask, return_state=True)
+        else:
+            h, v_first = self.tmix(x1, v_first, x_prev=tmix_prev, h_in=h_in,
+                                   mask=mask)
         x = x + h
-        x = x + self.cmix(self.ln2(x))
+        x2 = self.ln2(x)
+        x = x + self.cmix(x2, x_prev=cmix_prev)
+        if return_state:
+            return x, v_first, h_out, gather_last(x1, end_idx), gather_last(x2, end_idx)
         return x, v_first
 
 
@@ -193,16 +248,62 @@ class RWKV7X070(nn.Module):
         mx.eval(self.parameters())
         return self
 
-    def body(self, idx):
-        """Run everything except the lm head; returns hidden states [B, T, D]."""
+    def body(self, idx, state=None, mask=None, end_idx=None, return_state=False):
+        """Всё кроме lm-головы; возвращает скрытые состояния [B, T, D].
+
+        state:        RWKVState — продолжить с этого состояния (или None).
+        mask:         [B, T] — 1 у реальных токенов, 0 у right-паддинга.
+                      Без неё пад-токены попадают в рекуррентность и портят
+                      финальное состояние (на сами скрытые состояния реальных
+                      позиций они, будучи справа, не влияют никогда).
+        end_idx:      [B] — позиция последнего реального токена; нужна только
+                      при return_state, чтобы снять token-shift там, а не в
+                      конце паддинга.
+        return_state: вернуть (h, RWKVState) вместо h.
+
+        Путь с состоянием намеренно не оборачивается в gradient checkpointing:
+        он существует ради инференса и обучения НАД замороженной базой, где
+        пересчёт активаций ничего не экономит.
+        """
         x = self.ln0(self.emb(idx))
         v_first = None
-        for block in self.blocks:
-            if self._grad_ckpt:
-                x, v_first = _nn_checkpoint(block)(x, v_first)
+
+        if not return_state and state is None:
+            for block in self.blocks:
+                if self._grad_ckpt:
+                    x, v_first = _nn_checkpoint(block)(x, v_first)
+                else:
+                    x, v_first = block(x, v_first)
+            return self.ln_out(x)
+
+        wkvs, tshifts, cshifts = [], [], []
+        for i, block in enumerate(self.blocks):
+            h_in = None if state is None else state.wkv[i]
+            tprev = None if state is None else state.tmix_shift[i]
+            cprev = None if state is None else state.cmix_shift[i]
+            if return_state:
+                x, v_first, h_out, ts, cs = block(
+                    x, v_first, h_in=h_in, mask=mask, tmix_prev=tprev,
+                    cmix_prev=cprev, end_idx=end_idx, return_state=True)
+                wkvs.append(h_out); tshifts.append(ts); cshifts.append(cs)
             else:
-                x, v_first = block(x, v_first)
-        return self.ln_out(x)
+                x, v_first = block(x, v_first, h_in=h_in, mask=mask,
+                                   tmix_prev=tprev, cmix_prev=cprev)
+
+        h = self.ln_out(x)
+        if return_state:
+            return h, RWKVState.stack(wkvs, tshifts, cshifts)
+        return h
+
+    def states(self, idx, mask=None, end_idx=None, state=None) -> RWKVState:
+        """Только состояние на конце последовательности, без скрытых состояний.
+
+        Это вход реранкера: он читает свёрнутую в state историю пары
+        (документ, запрос), а не потокенные активации.
+        """
+        _, st = self.body(idx, state=state, mask=mask, end_idx=end_idx,
+                          return_state=True)
+        return st
 
     def __call__(self, idx):
         return self.head(self.body(idx))
