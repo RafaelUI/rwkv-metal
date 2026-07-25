@@ -47,6 +47,7 @@ class RerankTrainConfig:
     loss_alpha: float = 1.0       # 1 = чистый listwise, 0 = чистый BCE
     temperature: float = 1.0
 
+    compile: bool = True          # mx.compile на шаг обучения
     eval_every: int = 0           # шагов между оценками held-out (0 = только в конце)
     log_every: int = 20
     checkpoint_path: str = "reranker_head.safetensors"
@@ -69,17 +70,23 @@ def _lr_at(step: int, total: int, cfg: RerankTrainConfig) -> float:
     return cfg.lr_min + (cfg.lr - cfg.lr_min) * decay
 
 
-def batch_scores(head, cache: StateCache, rows: mx.array) -> mx.array:
-    """rows: [b] индексы примеров. Возвращает скоры [b, C].
+def batch_states(cache: StateCache, rows: np.ndarray):
+    """rows: [b] индексы примеров → (states [b·C, ...] mx, labels [b] mx, C).
 
-    Состояния кандидатов разворачиваются в один плоский батч b·C, чтобы
-    голова прошла по ним одним вызовом, и сворачиваются обратно.
+    Гейтеринг идёт в numpy, в MLX попадает только батч. Кэш при этом может
+    быть memmap и вообще не находиться в памяти.
     """
     pairs = cache.pair_index[rows]                 # [b, C]
     b, C = pairs.shape
-    flat = pairs.reshape(-1)
-    states = cache.states[flat]                    # [b*C, n_src, H, S, S]
-    return head(states).reshape(b, C)
+    states = cache.gather(pairs.reshape(-1))       # [b*C, n_src, H, S, S]
+    return states, mx.array(cache.labels[rows]), C
+
+
+def batch_scores(head, cache: StateCache, rows) -> mx.array:
+    """Скоры [b, C] для примеров `rows`."""
+    rows = np.asarray(rows if not isinstance(rows, mx.array) else np.array(rows))
+    states, _, C = batch_states(cache, rows)
+    return head(states).reshape(-1, C)
 
 
 def evaluate(head, cache: StateCache, batch_size: int = 64) -> dict:
@@ -89,12 +96,12 @@ def evaluate(head, cache: StateCache, batch_size: int = 64) -> dict:
     ranks = []
     losses = []
     for start in range(0, n, batch_size):
-        rows = mx.arange(start, min(start + batch_size, n))
-        scores = batch_scores(head, cache, rows)
-        labels = cache.labels[rows]
-        losses.append(float(mixed_loss(scores, labels, 1.0, 1.0)) * rows.shape[0])
+        rows = np.arange(start, min(start + batch_size, n))
+        states, labels, C = batch_states(cache, rows)
+        scores = head(states).reshape(-1, C)
+        losses.append(float(mixed_loss(scores, labels, 1.0, 1.0)) * len(rows))
         s = np.array(scores.astype(mx.float32))
-        lab = np.array(labels)
+        lab = cache.labels[rows]
         gold = s[np.arange(len(lab)), lab]
         # Ранг со средним по связкам: 1 + (строго больших) + (равных-1)/2.
         # Без этого необученная голова (все скоры равны) получила бы ранг 1 и
@@ -142,12 +149,31 @@ def train_reranker(reranker, train_cache: StateCache,
     opt = optim.AdamW(learning_rate=cfg.lr, betas=(cfg.beta1, cfg.beta2),
                       eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
 
-    def loss_fn(h, rows):
-        scores = batch_scores(h, train_cache, rows)
-        return mixed_loss(scores, train_cache.labels[rows],
+    C = train_cache.n_cand
+
+    def loss_fn(h, states, labels):
+        return mixed_loss(h(states).reshape(-1, C), labels,
                           cfg.loss_alpha, cfg.temperature)
 
     grad_fn = nn.value_and_grad(head, loss_fn)
+
+    def eager_step(states, labels):
+        loss, grads = grad_fn(head, states, labels)
+        grads, gnorm = optim.clip_grad_norm(grads, max_norm=cfg.grad_clip)
+        opt.update(head, grads)
+        return loss, gnorm
+
+    # mx.compile: шаг головы — это сотни мелких операций на одном токене, то
+    # есть время уходит в диспатч, а не в арифметику. Компиляция сливает их в
+    # один граф. Формы фиксированы (последний неполный батч отбрасывается),
+    # поэтому перекомпиляций нет. `inputs`/`outputs` обязаны включать
+    # состояние головы и оптимизатора — иначе обновления весов останутся
+    # снаружи графа и шаг просто не будет ничего менять.
+    if cfg.compile:
+        _state = [head.state, opt.state, mx.random.state]
+        step_fn = mx.compile(eager_step, inputs=_state, outputs=_state)
+    else:
+        step_fn = eager_step
 
     history = []
     best = {"mrr": -1.0}
@@ -158,12 +184,10 @@ def train_reranker(reranker, train_cache: StateCache,
     for epoch in range(cfg.epochs):
         order = rng.permutation(n)
         for si in range(steps_per_epoch):
-            rows = mx.array(order[si * cfg.batch_size:(si + 1) * cfg.batch_size]
-                            .astype(np.int32))
+            rows = order[si * cfg.batch_size:(si + 1) * cfg.batch_size]
+            states, labels, _ = batch_states(train_cache, rows)
             opt.learning_rate = _lr_at(step, total, cfg)
-            loss, grads = grad_fn(head, rows)
-            grads, gnorm = optim.clip_grad_norm(grads, max_norm=cfg.grad_clip)
-            opt.update(head, grads)
+            loss, gnorm = step_fn(states, labels)
             mx.eval(loss, head.parameters(), opt.state)
             lv = float(loss)
             history.append({"step": step, "epoch": epoch, "loss": lv,

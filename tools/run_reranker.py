@@ -75,16 +75,50 @@ def parse_args():
 
 
 def slice_cache(cache: StateCache, cache_sources, wanted) -> StateCache:
-    """Взять из кэша только нужные конфигурации слои (ось источников)."""
+    """Взять из кэша только нужные конфигурации слои (ось источников).
+
+    Непрерывный диапазон берётся ОБЫЧНЫМ срезом — это view, memmap остаётся
+    memmap и в память ничего не тянется. Fancy-индексация (`states[:, [0, 2]]`)
+    вместо этого прочитала бы файл целиком и материализовала копию, поэтому она
+    только как запасной путь.
+    """
     pos = [cache_sources.index(s) for s in wanted]
-    return StateCache(states=cache.states[:, mx.array(np.array(pos, np.int32))],
-                      pair_index=cache.pair_index, labels=cache.labels)
+    if pos == list(range(pos[0], pos[0] + len(pos))):
+        states = cache.states[:, pos[0]:pos[0] + len(pos)]
+    else:
+        states = cache.states[:, pos]
+    return StateCache(states=states, pair_index=cache.pair_index,
+                      labels=cache.labels)
 
 
 def subset(cache: StateCache, rows) -> StateCache:
-    a = mx.array(np.array(rows, np.int32))
+    a = np.asarray(rows, dtype=np.int32)
     return StateCache(states=cache.states, pair_index=cache.pair_index[a],
                       labels=cache.labels[a])
+
+
+def memory_report() -> dict:
+    """Память процесса по данным СИСТЕМЫ, а не аллокатора MLX.
+
+    mx.get_peak_memory() показывает пик пула MLX и ничего не знает ни про
+    numpy-буферы, ни про веса, ни про то, ушла ли машина в своп. Для
+    честного отчёта нужен RSS процесса и активность свопа.
+    """
+    import resource
+    import subprocess
+    # ru_maxrss: на macOS в байтах, на Linux в килобайтах
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_peak = raw if sys.platform == "darwin" else raw * 1024
+    out = {"peak_rss_gb": rss_peak / 1e9, "mlx_peak_gb": mx.get_peak_memory() / 1e9}
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        for line in vm.splitlines():
+            if "Swapins" in line or "Swapouts" in line:
+                k, v = line.split(":")
+                out[k.strip().lower()] = int(v.strip().rstrip("."))
+    except Exception:
+        pass
+    return out
 
 
 def ranking_metrics(scores: np.ndarray, labels: np.ndarray) -> dict:
@@ -134,7 +168,7 @@ def head_scores(head, cache: StateCache) -> np.ndarray:
     from rwkv_metal.reranker import batch_scores
     out = []
     for start in range(0, cache.n_samples, 64):
-        rows = mx.arange(start, min(start + 64, cache.n_samples))
+        rows = np.arange(start, min(start + 64, cache.n_samples))
         s = batch_scores(head, cache, rows)
         mx.eval(s)
         out.append(np.array(s.astype(mx.float32)))
@@ -233,9 +267,13 @@ def main():
     probe = Reranker(base, RerankerConfig(layer_idx=tuple(cache_layers),
                                           n_probe=args.n_probe))
     t0 = time.time()
-    if args.cache_path and os.path.exists(os.path.expanduser(args.cache_path)):
-        print(f"кэш состояний загружается из {args.cache_path}")
-        cache = StateCache.load(os.path.expanduser(args.cache_path))
+    cpath = os.path.expanduser(args.cache_path) if args.cache_path else None
+    npy = (cpath[:-4] if cpath and cpath.endswith(".npy") else cpath)
+    # обе части обязаны быть на месте: .npy с состояниями мог остаться от
+    # упавшего прогона, а без .idx.npz он бесполезен
+    if cpath and os.path.exists(npy + ".npy") and os.path.exists(npy + ".idx.npz"):
+        print(f"кэш состояний загружается (memmap) из {npy}.npy")
+        cache = StateCache.load(npy, mmap=True)
         if cache.n_samples != len(samples) or cache.n_cand != args.candidates:
             raise SystemExit(
                 f"кэш не соответствует данным: в кэше {cache.n_samples}×"
@@ -249,14 +287,13 @@ def main():
                              max_query_tokens=args.max_query_tokens,
                              doc_batch=args.doc_batch,
                              query_batch=args.query_batch,
-                             dtype=mx.bfloat16, verbose=True)
-        if args.cache_path:
-            cache.save(os.path.expanduser(args.cache_path))
-            print(f"кэш сохранён в {args.cache_path}")
+                             dtype=mx.float16, out_path=npy, verbose=True)
+        if npy:
+            print(f"кэш записан в {npy}.npy")
     report["stages"]["encode"] = {
         "seconds": time.time() - t0, "pairs": cache.n_pairs,
         "layers": cache_layers, "gb": cache.nbytes() / 1e9,
-        "peak_gb": mx.get_peak_memory() / 1e9,
+        "mmapped": cache.mmapped, **memory_report(),
     }
     print(f"кэш готов: {cache.n_pairs} пар, {cache.nbytes()/1e9:.2f} ГБ, "
           f"{time.time()-t0:.0f}s")
@@ -305,7 +342,7 @@ def main():
         flush()
 
     report["total_seconds"] = time.time() - t_start
-    report["peak_gb"] = mx.get_peak_memory() / 1e9
+    report["memory"] = memory_report()
     flush()
 
     print("\n" + "=" * 80)
@@ -327,7 +364,9 @@ def main():
     print("=" * 80)
     print("vs hard — попарная точность против майненного hard-негатива; "
           "vs случ. — против случайного документа пула")
-    print(f"всего {report['total_seconds']/60:.1f} мин, пик {report['peak_gb']:.2f} ГБ")
+    m = report["memory"]
+    print(f"всего {report['total_seconds']/60:.1f} мин | пик RSS процесса "
+          f"{m['peak_rss_gb']:.2f} ГБ (пул MLX {m['mlx_peak_gb']:.2f} ГБ)")
     print(f"отчёт: {report_path}")
 
 

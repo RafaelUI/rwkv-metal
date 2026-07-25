@@ -163,10 +163,12 @@ Each row's state freezes at its last real token, independent of padding and of
 batch neighbours. Verified against individual unpadded passes in
 `tests/test_wkv7_state.py`.
 
-> Not available on `RWKV7` (the from-scratch pretraining architecture): it
-> carries token-shift between blocks, which makes an exact continuation
-> impossible to define. `RWKV7.body` raises `NotImplementedError` for state
-> arguments — details in [`reranker.md`](./reranker.md#not-available-on-rwkv7).
+> Works on both architectures. `RWKV7` (the from-scratch pretraining model) used
+> to carry token-shift between blocks, which leaked future information and made
+> an exact continuation undefinable; that is fixed — details in
+> [`reranker.md`](./reranker.md#the-rwkv7-token-shift-leak-fixed). Only
+> `legacy_token_shift=True`, which reproduces the old behaviour for old
+> checkpoints, still refuses state arguments.
 
 ---
 

@@ -57,7 +57,8 @@ class RerankerInference:
                  instruct: str = DEFAULT_INSTRUCT,
                  max_doc_tokens: int = 384,
                  max_query_tokens: int = 96,
-                 terminator: Optional[int] = 0):
+                 terminator: Optional[int] = 0,
+                 compile: bool = True):
         self.model = reranker
         self.tok = tokenizer
         self.template = template or PairTemplate()
@@ -65,6 +66,21 @@ class RerankerInference:
         self.max_doc_tokens = max_doc_tokens
         self.max_query_tokens = max_query_tokens
         self.terminator = terminator
+        # Голова — это сотни мелких операций на одном токене, то есть время
+        # уходит в диспатч. Компиляция ускоряет её вдвое (замерено: 13.4 →
+        # 7.1 мс на 256 пар). `inputs=[head.state]` обязателен: без него
+        # веса вмораживаются в граф на первом вызове, и load_head() после
+        # этого молча ни на что не влияет.
+        self._compile = compile
+        self._scorer = None
+
+    def _score_states(self, sel):
+        if not self._compile:
+            return self.model.score_states(sel)
+        if self._scorer is None:
+            head = self.model.head
+            self._scorer = mx.compile(lambda s: head(s), inputs=[head.state])
+        return self._scorer(sel)
 
     @classmethod
     def from_checkpoint(cls, reranker, tokenizer, head_path: str, **overrides):
@@ -117,7 +133,7 @@ class RerankerInference:
             ]
             idx, mask, end_idx = _batch_ids(seqs)
             st = self.model.encode(idx, mask=mask, end_idx=end_idx)
-            s = self.model.score_states(self.model.select(st))
+            s = self._score_states(self.model.select(st))
             mx.eval(s)
             out.append(np.array(s.astype(mx.float32)))
         return np.concatenate(out)
@@ -195,7 +211,7 @@ class RerankerInference:
             sub = index.state[mx.array(np.array(part, dtype=np.int32))]
             idx, mask, end_idx = _batch_ids([q_ids] * len(part))
             st = self.model.encode(idx, mask=mask, end_idx=end_idx, state=sub)
-            s = self.model.score_states(self.model.select(st))
+            s = self._score_states(self.model.select(st))
             mx.eval(s)
             out.append(np.array(s.astype(mx.float32)))
         return np.concatenate(out)

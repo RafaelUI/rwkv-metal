@@ -165,18 +165,22 @@ with either:
 | Purpose | train from scratch | load official weights |
 | `ln_x` | LayerNorm | GroupNorm (per head) |
 | low-rank size | fixed 64 | derived from model width |
-| token-shift | carried between blocks | zero-padded per block |
-| state API (`return_state`, `mask`) | not supported | yes |
+| token-shift | zero-padded per block | zero-padded per block |
+| state API (`return_state`, `mask`) | yes | yes |
 | pair with | `init_weights()` | `load_pretrained()` |
 
-> The inter-block token-shift carry in `RWKV7` leaks future information: block
-> `i+1` receives block `i`'s **last** output as its "previous token", which is
-> in the future relative to position 0. Measured — changing only the last input
-> token changes hidden states at positions `0..T-2` by up to 0.30, while the
-> same test on `RWKV7X070` gives exactly 0.0. It also makes an exact
-> continuation from a saved state impossible to define, which is why the state
-> API is x070-only. See
-> [docs/reranker.md](docs/reranker.md#not-available-on-rwkv7).
+> **Fixed: `RWKV7` used to leak future information.** It carried token-shift
+> *between* blocks — block `i+1` received block `i`'s **last** output as its
+> "previous token", which is in the future relative to position 0. The damage
+> was smaller than it sounds: the perturbation walks forward one position per
+> layer, so it touched the first ~`n_layer` positions of the window (measured
+> `max|Δh|` 0.209 at position 0, under 0.007 after that, nothing past position
+> 9 for a 6-layer model at ctx 512), and a 400-step from-scratch A/B came out
+> within noise. It mattered because train and serve disagreed and because
+> "continue from a saved state" could not be defined. Both architectures now
+> zero-pad per block, both are causal (`tests/test_wkv7_state.py`), and both
+> support the state API. `RWKV7(cfg, legacy_token_shift=True)` reproduces the
+> old behaviour for checkpoints trained before the fix.
 
 ---
 
@@ -217,17 +221,11 @@ the community:
   gradients for the backward), in the same spirit as the WKV kernel. This would
   lower the floor for 2.9B+ models. **If you want to benchmark or implement
   this, PRs are welcome.**
-- **Fix the token-shift leak in `RWKV7`.** The from-scratch architecture passes
-  each block's last output as the next block's "previous token" — a future token
-  relative to position 0 (see the note above). Making it zero-pad per block, as
-  x070 does, would remove the leak and unlock the state API for from-scratch
-  checkpoints. It changes pretraining semantics, so it wants a measured
-  before/after rather than a blind patch.
 - **A `model.generate()`.** State plumbing for streaming decode is in place
   (`body(idx, state=..., return_state=True)`); the sampler, stop conditions and
-  batching wrapper are not. A single-token step is also dominated by fixed
-  dispatch overhead (~14 ms at `B=1` on 0.1B) — `mx.compile` over the step is
-  the obvious win.
+  batching wrapper are not. A single-token step costs ~10.6 ms at `B=1` on
+  0.1B, and `mx.compile` only takes it to 9.9 ms — unlike the reranker head,
+  this path is not dispatch-bound, so the win has to come from elsewhere.
 - **Reranker on a non-frozen base.** Training the head on cached states is what
   makes it cheap, but it rules out LoRA on the base. An online-encoding trainer
   would trade speed for that flexibility.

@@ -37,6 +37,10 @@ class PretrainConfig:
     n_embd:     int = 768
     vocab_size: int = 21248
     head_size:  int = 64          # размер головы внимания; n_embd должно делиться на head_size
+    # Прежний межблочный перенос token-shift (подглядывал в будущее — см.
+    # RWKV7.body). True нужен ТОЛЬКО чтобы дообучить/воспроизвести чекпоинт,
+    # обученный до исправления.
+    legacy_token_shift: bool = False
 
     @property
     def n_head(self) -> int:

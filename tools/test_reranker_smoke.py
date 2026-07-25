@@ -27,6 +27,7 @@ from mlx.utils import tree_map
 
 from rwkv_metal.model.rwkv7_x070 import RWKV7X070
 from rwkv_metal.pretrain.config import PretrainConfig
+from rwkv_metal.reranker.encode import StateCache
 from rwkv_metal.reranker import (
     Reranker, RerankerConfig, RerankerInference,
     PairTemplate, RerankSample, encode_pairs, encode_pairs_direct,
@@ -113,7 +114,6 @@ def make_random_state_cache(n_samples=64, n_cand=4, n_src=1, H=2, S=64, seed=0):
     других. Правильный кандидат помечен фиксированным сдвигом, общим для всех
     примеров, — выучиваемо, но не тривиально (сдвиг мал по сравнению с шумом).
     """
-    from rwkv_metal.reranker.encode import StateCache
     rng = np.random.default_rng(seed)
     n_pairs = n_samples * n_cand
     states = rng.standard_normal((n_pairs, n_src, H, S, S)).astype(np.float32) * 0.5
@@ -122,8 +122,7 @@ def make_random_state_cache(n_samples=64, n_cand=4, n_src=1, H=2, S=64, seed=0):
     pair_index = np.arange(n_pairs, dtype=np.int32).reshape(n_samples, n_cand)
     for si in range(n_samples):
         states[pair_index[si, labels[si]]] += mark
-    return StateCache(states=mx.array(states), pair_index=mx.array(pair_index),
-                      labels=mx.array(labels))
+    return StateCache(states=states, pair_index=pair_index, labels=labels)
 
 
 def main():
@@ -136,12 +135,12 @@ def main():
     cache = encode_pairs(model, tok, pool, samples, max_doc_tokens=96,
                          max_query_tokens=48, doc_batch=8, query_batch=16,
                          dtype=mx.float32, verbose=False)
-    rows = mx.arange(8)
+    rows = np.arange(8)
     s0 = batch_scores(model.head, cache, rows)
     mx.eval(s0)
     check("голова zero-init даёт нулевые скоры",
           float(mx.abs(s0).max()) < 1e-6, f"max|score| = {float(mx.abs(s0).max()):.2e}")
-    l0 = float(listwise_loss(s0, cache.labels[rows]))
+    l0 = float(listwise_loss(s0, mx.array(cache.labels[rows])))
     check("стартовый лосс == ln(C)", abs(l0 - np.log(cache.n_cand)) < 1e-5,
           f"{l0:.6f} против {np.log(cache.n_cand):.6f}")
 
@@ -150,7 +149,8 @@ def main():
     # после обрезки совпадают, состояния совпадут, градиент занулится, а
     # сравнения кэша со сплошным проходом пройдут на нулях.
     pair0 = cache.pair_index[0]
-    spread = float(mx.abs(cache.states[pair0[0]] - cache.states[pair0[1]]).max())
+    spread = float(np.abs(cache.states[pair0[0]].astype(np.float32)
+                          - cache.states[pair0[1]].astype(np.float32)).max())
     check("состояния разных кандидатов различаются", spread > 1e-3,
           f"max|Δ| = {spread:.3e}")
 
@@ -170,22 +170,40 @@ def main():
         direct = encode_pairs_direct(model, tok, direct_pairs, template=tmpl,
                                      max_doc_tokens=96, max_query_tokens=48,
                                      batch_size=8)
-        cached = cch.states[cch.pair_index[:6].reshape(-1)]
+        cached = mx.array(cch.states[cch.pair_index[:6].reshape(-1)]).astype(mx.float32)
+        direct = direct.astype(mx.float32)
         mx.eval(direct, cached)
         d = float(mx.abs(direct - cached).max())
         scale = float(mx.abs(direct).max())
         check(f"кэш == сплошной проход ({name})", d / max(1e-9, scale) < 1e-4,
               f"отн. расхождение {d/max(1e-9,scale):.2e}")
 
+    # ── 2b. кэш на диске: сохранение, memmap-загрузка, пересохранение ────
+    # Отдельный тест потому, что здесь была реальная ошибка: save() открывал
+    # целевой .npy на запись, читая при этом из memmap ЭТОГО ЖЕ файла —
+    # данные портились, а numpy успевал вытянуть весь массив в память.
+    with tempfile.TemporaryDirectory() as td:
+        cpath = os.path.join(td, "c.npy")
+        cache.save(cpath)
+        loaded = StateCache.load(cpath, mmap=True)
+        ref = np.asarray(cache.states).astype(np.float32)
+        check("кэш переживает сохранение и memmap-загрузку",
+              loaded.mmapped
+              and np.abs(np.asarray(loaded.states).astype(np.float32) - ref).max() == 0,
+              f"memmap={loaded.mmapped}")
+        loaded.save(cpath)          # states — memmap этого же файла
+        again = StateCache.load(cpath, mmap=True)
+        check("пересохранение memmap в себя не портит данные",
+              np.abs(np.asarray(again.states).astype(np.float32) - ref).max() == 0)
+
     # ── 3. голова обучается ──────────────────────────────────────────────
     # На состояниях, собранных напрямую: проверяется обучаемость головы, а не
     # осведомлённость случайно инициализированной базы.
-    from rwkv_metal.reranker.encode import StateCache
     full = make_random_state_cache(n_samples=96, n_cand=4,
                                    n_src=len(model.head.unique_sources),
                                    H=cfg.n_head, S=cfg.head_size)
     def subcache(c, idx):
-        a = mx.array(np.array(idx, np.int32))
+        a = np.array(idx, np.int32)
         return StateCache(states=c.states, pair_index=c.pair_index[a],
                           labels=c.labels[a])
     tr = subcache(full, list(range(0, 80)))
@@ -210,11 +228,11 @@ def main():
               f"{before['mrr']:.3f} → {after['mrr']:.3f}")
 
         # ── 5. сохранение/загрузка ───────────────────────────────────────
-        s_before = batch_scores(model.head, ev, mx.arange(4))
+        s_before = batch_scores(model.head, ev, np.arange(4))
         mx.eval(s_before)
         model2 = Reranker(base, RerankerConfig(layer_idx=(-1,)))
         model2.load_head(ckpt)
-        s_after = batch_scores(model2.head, ev, mx.arange(4))
+        s_after = batch_scores(model2.head, ev, np.arange(4))
         mx.eval(s_after)
         check("голова сохраняется и грузится",
               float(mx.abs(s_before - s_after).max()) < 1e-5,
@@ -232,7 +250,7 @@ def main():
             check("несовпадающая конфигурация отвергается", True)
 
         model3 = Reranker.from_head(base, ckpt)
-        s3 = batch_scores(model3.head, ev, mx.arange(4))
+        s3 = batch_scores(model3.head, ev, np.arange(4))
         mx.eval(s3)
         check("from_head восстанавливает конфигурацию",
               model3.head.layer_idx == model.head.layer_idx

@@ -217,6 +217,93 @@ def test_state_roundtrip_batched_continuation():
         assert d / max(1e-9, scale) < 1e-4, f"запрос {i}: {d} (scale {scale})"
 
 
+def _tiny_scratch(seed=0, n_layer=3, n_embd=128, vocab=512, legacy=False):
+    from rwkv_metal.model.rwkv7 import RWKV7
+    from mlx.utils import tree_map
+    mx.random.seed(seed)
+    cfg = PretrainConfig(n_layer=n_layer, n_embd=n_embd, vocab_size=vocab)
+    model = RWKV7(cfg, legacy_token_shift=legacy)
+    model.update(tree_map(lambda p: p + mx.random.normal(p.shape) * 0.02,
+                          model.parameters()))
+    mx.eval(model.parameters())
+    return model, cfg
+
+
+def _future_leak(model, cfg, seed=0):
+    """max|Δh| на позициях 0..T-2 при смене ТОЛЬКО последнего токена.
+
+    У каузальной модели строго ноль: последний токен не может влиять на то,
+    что было до него.
+    """
+    rng = np.random.default_rng(seed)
+    a = rng.integers(1, cfg.vocab_size, size=(1, 24)).astype(np.int32)
+    b = a.copy()
+    b[0, -1] = (b[0, -1] % (cfg.vocab_size - 2)) + 1
+    ha, hb = model.body(mx.array(a)), model.body(mx.array(b))
+    mx.eval(ha, hb)
+    return _maxdiff(ha[:, :-1], hb[:, :-1])
+
+
+def test_x070_is_causal():
+    model, cfg = _tiny_model(seed=21)
+    leak = _future_leak(model, cfg)
+    assert leak == 0.0, f"x070 подглядывает в будущее: {leak}"
+
+
+def test_scratch_arch_is_causal():
+    """RWKV7 после починки token-shift: последний токен не влияет на прошлое.
+
+    До починки межблочный перенос давал утечку порядка 0.3 — legacy-режим
+    ниже её и воспроизводит, чтобы регрессия была видна, а не только описана.
+    """
+    model, cfg = _tiny_scratch(seed=22)
+    leak = _future_leak(model, cfg)
+    assert leak == 0.0, f"RWKV7 подглядывает в будущее: {leak}"
+
+    legacy, cfg_l = _tiny_scratch(seed=22, legacy=True)
+    leak_legacy = _future_leak(legacy, cfg_l)
+    assert leak_legacy > 1e-3, (
+        f"legacy-режим должен воспроизводить утечку, а даёт {leak_legacy}"
+    )
+
+
+def test_scratch_arch_continuation_equals_full_pass():
+    """После починки RWKV7 поддерживает продолжение с состояния так же
+    точно, как x070."""
+    model, cfg = _tiny_scratch(seed=23)
+    rng = np.random.default_rng(24)
+    T1, T2 = 31, 11
+    idx = mx.array(rng.integers(1, cfg.vocab_size, size=(1, T1 + T2)).astype(np.int32))
+
+    h_full, st_full = model.body(idx, return_state=True)
+    _, st1 = model.body(idx[:, :T1], return_state=True)
+    h2, st2 = model.body(idx[:, T1:], state=st1, return_state=True)
+    mx.eval(h_full, st_full.wkv, h2, st2.wkv)
+
+    scale = float(mx.abs(st_full.wkv).max())
+    assert _maxdiff(h_full[:, T1:], h2) < 1e-3
+    assert _maxdiff(st_full.wkv, st2.wkv) / max(1e-9, scale) < 1e-4
+
+
+def test_scratch_arch_ragged_batch():
+    """Right-padding с маской у RWKV7 тоже точен."""
+    model, cfg = _tiny_scratch(seed=25)
+    rng = np.random.default_rng(26)
+    lens = [37, 19, 6]
+    T = max(lens)
+    seqs = [rng.integers(1, cfg.vocab_size, size=L).tolist() for L in lens]
+    idx = mx.array(np.array([s + [0] * (T - len(s)) for s in seqs], dtype=np.int32))
+    st_batch = model.states(idx, mask=build_mask(lens, T),
+                            end_idx=mx.array([L - 1 for L in lens]))
+    mx.eval(st_batch.wkv)
+    for i, s in enumerate(seqs):
+        st_i = model.states(mx.array(np.array([s], dtype=np.int32)))
+        mx.eval(st_i.wkv)
+        scale = float(mx.abs(st_i.wkv).max())
+        d = _maxdiff(st_batch.wkv[:, i:i + 1], st_i.wkv)
+        assert d / max(1e-9, scale) < 1e-5, f"строка {i}: {d}"
+
+
 def test_streaming_decode_matches_full_pass():
     """Потокенный декод с переносом состояния == пересчёт всего контекста.
 

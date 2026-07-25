@@ -1,7 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.utils import checkpoint as _nn_checkpoint
-from ..kernel.wkv7 import wkv7
+from ..kernel.wkv7 import wkv7, wkv7_step
+from .state import RWKVState, gather_last
 
 
 def l2_norm(x):
@@ -57,11 +58,17 @@ class RWKV_Tmix_x070(nn.Module):
         # Нормализация выхода
         self.ln_x = nn.LayerNorm(D)
 
-    def __call__(self, x, x_prev, v_first):
+    def __call__(self, x, x_prev, v_first, h_in=None, mask=None,
+                 return_state=False):
+        """x_prev: [B, 1, D] — «предыдущий» токен для позиции 0, или None
+        (нулевой паддинг). Смотри `RWKV7.body` про то, почему None здесь
+        теперь норма, а не заглушка."""
         B, T, D = x.shape
         H, S = self.H, self.S
 
         # Token shift
+        if x_prev is None:
+            x_prev = mx.zeros_like(x[:, :1])
         xx = mx.concatenate([x_prev, x[:, :-1]], axis=1) - x
         xr = x + xx * self.x_r
         xw = x + xx * self.x_w
@@ -106,15 +113,35 @@ class RWKV_Tmix_x070(nn.Module):
         a = -kk
         b = kk * iclr
 
+        # Маска паддинга: пад-позиции делаются no-op для рекуррентности
+        # (w=1, k=0, b=0 → h_next = h). См. RWKV_Tmix_x070 в rwkv7_x070.py.
+        k_wkv, b_wkv = k, b
+        if mask is not None:
+            m = mask.reshape(B, T, 1, 1).astype(w.dtype)
+            w = w * m + (1.0 - m)
+            k_wkv = k_wkv * m
+            b_wkv = b_wkv * m
+
         # WKV-7
-        out, _ = wkv7(r, w, k, v, a, b, training=True)  # [B, T, H, S]
+        if T == 1:
+            if h_in is None:
+                h_in = mx.zeros((B, H, S, S), dtype=mx.float32)
+            out, h_out = wkv7_step(r, w, k_wkv, v, a, b_wkv, h_in)
+        elif return_state or h_in is not None:
+            out, h_out = wkv7(r, w, k_wkv, v, a, b_wkv, training=True,
+                              state=h_in, return_state=True)
+        else:
+            out, h_out = wkv7(r, w, k_wkv, v, a, b_wkv, training=True)
 
         # Бонусный член: прямое взаимодействие r, k, v
         bonus = (r * k * self.r_k).sum(axis=-1, keepdims=True) * v
         out   = (out + bonus).reshape(B, T, D)
 
         out = self.ln_x(out)
-        return self.o_proj(out * gate), v_first
+        y = self.o_proj(out * gate)
+        if return_state:
+            return y, v_first, h_out
+        return y, v_first
 
 
 class RWKV_CMix_x070(nn.Module):
@@ -125,7 +152,9 @@ class RWKV_CMix_x070(nn.Module):
         self.key   = nn.Linear(D, D * 4, bias=False)
         self.value = nn.Linear(D * 4, D, bias=False)
 
-    def __call__(self, x, x_prev):
+    def __call__(self, x, x_prev=None):
+        if x_prev is None:
+            x_prev = mx.zeros_like(x[:, :1])
         xx = mx.concatenate([x_prev, x[:, :-1]], axis=1) - x
         xk = x + xx * self.x_k
         return self.value(nn.relu(self.key(xk)) ** 2)
@@ -176,7 +205,35 @@ class RWKVBlock(nn.Module):
         self.tmix = RWKV_Tmix_x070(config, layer_id)
         self.cmix = RWKV_CMix_x070(config)
 
-    def __call__(self, x, x_prev, v_first):
+    def __call__(self, x, v_first, h_in=None, mask=None, tmix_prev=None,
+                 cmix_prev=None, end_idx=None, return_state=False):
+        """Каждый микс шифтует СВОЙ вход с нулевым паддингом на позиции 0.
+
+        Раньше здесь был один общий `x_prev`, приходивший снаружи как выход
+        ПРЕДЫДУЩЕГО блока на последней позиции чанка, — то есть будущее
+        относительно позиции 0. См. `RWKV7.body`.
+        """
+        x1 = self.ln1(x)
+        if return_state:
+            h, v_first, h_out = self.tmix(x1, tmix_prev, v_first, h_in=h_in,
+                                          mask=mask, return_state=True)
+        else:
+            h, v_first = self.tmix(x1, tmix_prev, v_first, h_in=h_in, mask=mask)
+        x = x + h
+        x2 = self.ln2(x)
+        x = x + self.cmix(x2, cmix_prev)
+        if return_state:
+            return x, v_first, h_out, gather_last(x1, end_idx), gather_last(x2, end_idx)
+        return x, v_first
+
+    def _legacy_call(self, x, x_prev, v_first):
+        """Прежнее поведение с межблочным переносом token-shift.
+
+        Оставлено только чтобы можно было воспроизвести чекпоинты, обученные
+        до исправления. Для нового обучения не используй: `x_prev` здесь —
+        последний токен чанка из предыдущего блока, то есть будущее для
+        позиции 0.
+        """
         h, v_first = self.tmix(self.ln1(x), x_prev, v_first)
         x = x + h
         x = x + self.cmix(self.ln2(x), x_prev)
@@ -184,11 +241,14 @@ class RWKVBlock(nn.Module):
 
 
 class RWKV7(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, legacy_token_shift: bool = False):
         super().__init__()
         self.config    = config
         self._train    = True
         self._grad_ckpt = False  # gradient checkpointing по блокам
+        # см. RWKV7.body — прежний межблочный перенос token-shift подглядывал
+        # в будущее; True только для воспроизведения старых чекпоинтов
+        self.legacy_token_shift = legacy_token_shift
         self.emb     = nn.Embedding(config.vocab_size, config.n_embd)
         self.ln0     = nn.LayerNorm(config.n_embd)
         self.blocks  = [RWKVBlock(config, i) for i in range(config.n_layer)]
@@ -218,42 +278,76 @@ class RWKV7(nn.Module):
     def body(self, idx, state=None, mask=None, end_idx=None, return_state=False):
         """Run everything except the lm head; returns hidden states [B, T, D].
 
-        Useful when you want hidden states without the (large) vocab projection,
-        e.g. custom loss heads or feature extraction.
+        Сигнатура и семантика — те же, что у `RWKV7X070.body`: `state`
+        (RWKVState) продолжает последовательность, `mask` помечает реальные
+        токены right-padded батча, `end_idx` говорит, где снимать token-shift.
 
-        ВНИМАНИЕ: работа с состоянием (state / return_state) здесь НЕ
-        поддерживается, и это не «пока не дошли руки». Межблочный перенос
-        token-shift ниже (`x_prev = x[:, -1:]` после каждого блока) отдаёт
-        блоку i+1 в качестве «предыдущего токена» ПОСЛЕДНИЙ токен текущего
-        чанка, то есть будущее относительно позиции 0. Проверяется прямо:
-        смена только последнего токена входа меняет скрытые состояния на
-        позициях 0..T-2 (в x070 — ровно ноль). Из-за этого «продолжить с
-        состояния» невозможно определить так, чтобы оно совпало со сплошным
-        проходом: значение, которое понадобилось бы на границе, зависит от
-        ещё не поступивших токенов.
+        Про legacy_token_shift
+        ----------------------
+        До этого здесь был межблочный перенос: `x_prev = x[:, -1:]` после
+        каждого блока, и блок i+1 получал в качестве «предыдущего токена»
+        ПОСЛЕДНИЙ токен чанка — будущее относительно позиции 0. Замер:
+        смена только последнего токена входа меняла скрытые состояния на
+        позициях 0..T-2 на 0.30 (у x070 — ровно 0.0). То есть при
+        teacher-forcing модель на первой позиции каждого слоя подглядывала
+        в конец окна, а на инференсе такого токена нет — расхождение между
+        обучением и применением, плюс невозможность определить продолжение
+        с состояния.
 
-        Для эмбеддингов, реранкера и любого инференса со state используй
-        RWKV7X070 (официальная архитектура, каузальная).
+        Теперь каждый микс шифтует свой вход с нулевым паддингом, как в
+        официальной x070. `legacy_token_shift=True` возвращает прежнее
+        поведение — только чтобы воспроизвести уже обученные этим кодом
+        чекпоинты, для нового обучения смысла нет.
         """
-        if state is not None or return_state or mask is not None or end_idx is not None:
-            raise NotImplementedError(
-                "RWKV7 (from-scratch арх.) не поддерживает работу с состоянием: "
-                "межблочный перенос token-shift делает продолжение с состояния "
-                "принципиально несовпадающим со сплошным проходом. "
-                "Используй RWKV7X070."
-            )
-        B, T    = idx.shape
-        x       = self.ln0(self.emb(idx))
-        # x_prev must match x.dtype, otherwise silent fp32/bf16 cast in token-shift
-        x_prev  = mx.zeros((B, 1, self.config.n_embd), dtype=x.dtype)
+        B, T = idx.shape
+        x = self.ln0(self.emb(idx))
         v_first = None
-        for block in self.blocks:
-            if self._grad_ckpt:
-                x, v_first = _nn_checkpoint(block)(x, x_prev, v_first)
+
+        if self.legacy_token_shift:
+            if state is not None or return_state or mask is not None:
+                raise NotImplementedError(
+                    "legacy_token_shift=True несовместим с состоянием: "
+                    "межблочный перенос token-shift делает продолжение "
+                    "принципиально несовпадающим со сплошным проходом."
+                )
+            x_prev = mx.zeros((B, 1, self.config.n_embd), dtype=x.dtype)
+            for block in self.blocks:
+                x, v_first = block._legacy_call(x, x_prev, v_first)
+                x_prev = x[:, -1:]
+            return self.ln_out(x)
+
+        if not return_state and state is None:
+            for block in self.blocks:
+                if self._grad_ckpt:
+                    x, v_first = _nn_checkpoint(block)(x, v_first)
+                else:
+                    x, v_first = block(x, v_first)
+            return self.ln_out(x)
+
+        wkvs, tshifts, cshifts = [], [], []
+        for i, block in enumerate(self.blocks):
+            h_in = None if state is None else state.wkv[i]
+            tprev = None if state is None else state.tmix_shift[i]
+            cprev = None if state is None else state.cmix_shift[i]
+            if return_state:
+                x, v_first, h_out, ts, cs = block(
+                    x, v_first, h_in=h_in, mask=mask, tmix_prev=tprev,
+                    cmix_prev=cprev, end_idx=end_idx, return_state=True)
+                wkvs.append(h_out); tshifts.append(ts); cshifts.append(cs)
             else:
-                x, v_first = block(x, x_prev, v_first)
-            x_prev     = x[:, -1:]
-        return self.ln_out(x)
+                x, v_first = block(x, v_first, h_in=h_in, mask=mask,
+                                   tmix_prev=tprev, cmix_prev=cprev)
+
+        h = self.ln_out(x)
+        if return_state:
+            return h, RWKVState.stack(wkvs, tshifts, cshifts)
+        return h
+
+    def states(self, idx, mask=None, end_idx=None, state=None) -> RWKVState:
+        """Только состояние на конце последовательности."""
+        _, st = self.body(idx, state=state, mask=mask, end_idx=end_idx,
+                          return_state=True)
+        return st
 
     def __call__(self, idx):
         return self.head(self.body(idx))

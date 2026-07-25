@@ -7,7 +7,7 @@
 
 Пример:
     .venv/bin/python tools/ablate_reranker.py \
-        --cache runs/reranker_0.1b/cache.safetensors \
+        --cache runs/reranker_0.1b/cache \
         --cache_layers 0,5,11 --eval_queries 150 \
         --seeds 0 1 2 --out runs/reranker_0.1b/ablation.json
 """
@@ -45,13 +45,19 @@ def parse_args():
 
 
 def slice_cache(cache, cache_sources, wanted):
+    """Непрерывный диапазон — обычным срезом (view, memmap не материализуется);
+    разрозненные слои — fancy-индексацией, которая читает файл целиком."""
     pos = [cache_sources.index(s) for s in wanted]
-    return StateCache(states=cache.states[:, mx.array(np.array(pos, np.int32))],
-                      pair_index=cache.pair_index, labels=cache.labels)
+    if pos == list(range(pos[0], pos[0] + len(pos))):
+        states = cache.states[:, pos[0]:pos[0] + len(pos)]
+    else:
+        states = cache.states[:, pos]
+    return StateCache(states=states, pair_index=cache.pair_index,
+                      labels=cache.labels)
 
 
 def subset(cache, rows):
-    a = mx.array(np.array(rows, np.int32))
+    a = np.asarray(rows, dtype=np.int32)
     return StateCache(states=cache.states, pair_index=cache.pair_index[a],
                       labels=cache.labels[a])
 

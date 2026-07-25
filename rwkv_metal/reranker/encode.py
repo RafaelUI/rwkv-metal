@@ -31,6 +31,7 @@ rwkv_metal.reranker.encode
 ~3.5 мс на пару. То есть добавить запросу ещё восемь кандидатов почти
 бесплатно, если документы уже в пуле.
 """
+import os
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -42,15 +43,41 @@ from ..model.state import RWKVState, build_mask
 from .data import PairTemplate, RerankSample
 
 
+def _to_numpy(x):
+    if isinstance(x, np.ndarray):
+        return x
+    return np.array(x.astype(mx.float32) if x.dtype == mx.bfloat16 else x)
+
+
 @dataclass
 class StateCache:
-    """states:     [n_pairs, n_src, H, S, S] — состояния пар
-    pair_index: [n_samples, n_cand] — индекс строки в states
-    labels:     [n_samples] — позиция правильного кандидата
+    """states:     [n_pairs, n_src, H, S, S] — состояния пар, numpy
+    pair_index: [n_samples, n_cand] — индекс строки в states, numpy
+    labels:     [n_samples] — позиция правильного кандидата, numpy
+
+    Почему numpy, а не mx.array
+    ---------------------------
+    Кэш — это гигабайты, а трогаем мы за шаг сотни строк. Держать его
+    mx.array означает, во-первых, лишнюю полную копию при создании (numpy-
+    буфер → mx), во-вторых, отсутствие способа НЕ держать его в памяти
+    целиком. numpy решает и то, и другое: батч набирается numpy-гейтерингом
+    (дёшево, локально) и превращается в mx.array уже в своём размере, а сам
+    массив может быть memmap — тогда кэш вообще не обязан влезать в RAM,
+    страницы подтягиваются по мере обращения.
+
+    Это не вкусовщина: на 16 ГБ машине кэш в паре гигабайт плюс база плюс
+    транзиентная копия — это своп, а своп портит не только скорость, но и
+    все замеры, снятые в это время.
     """
-    states: mx.array
-    pair_index: mx.array
-    labels: mx.array
+    states: np.ndarray
+    pair_index: np.ndarray
+    labels: np.ndarray
+
+    def __post_init__(self):
+        # приходящие mx.array (старые вызовы, тесты) приводим к numpy
+        self.states = _to_numpy(self.states)
+        self.pair_index = _to_numpy(self.pair_index).astype(np.int32)
+        self.labels = _to_numpy(self.labels).astype(np.int32)
 
     @property
     def n_pairs(self) -> int:
@@ -65,19 +92,46 @@ class StateCache:
         return self.pair_index.shape[1]
 
     def nbytes(self) -> int:
-        return self.states.nbytes
+        return int(self.states.nbytes)
+
+    @property
+    def mmapped(self) -> bool:
+        return isinstance(self.states, np.memmap)
+
+    def gather(self, rows: np.ndarray) -> mx.array:
+        """Строки кэша → mx.array. Единственное место, где данные попадают
+        в MLX, и попадают ровно в размере батча."""
+        return mx.array(np.ascontiguousarray(self.states[rows]))
 
     def save(self, path: str):
-        mx.save_safetensors(path, {
-            "states": self.states,
-            "pair_index": self.pair_index,
-            "labels": self.labels,
-        })
+        """`path` — .npy для состояний; рядом ляжет .idx.npz с индексами.
+
+        Если состояния УЖЕ являются memmap'ом этого же файла (кэш строился с
+        out_path), переписывать нечего: достаточно сбросить страницы. Наивный
+        `np.save` в этом случае открыл бы целевой файл на запись, обрезав его
+        под тем самым memmap'ом, из которого читает, — данные портятся, а
+        numpy при этом успевает вытянуть весь массив в память.
+        """
+        path = str(path)
+        base = path[:-4] if path.endswith(".npy") else path
+        target = os.path.abspath(base + ".npy")
+        src = os.path.abspath(getattr(self.states, "filename", "") or "")
+        if isinstance(self.states, np.memmap) and src == target:
+            self.states.flush()
+        else:
+            np.save(target, self.states)
+        np.savez(base + ".idx.npz", pair_index=self.pair_index,
+                 labels=self.labels)
 
     @staticmethod
-    def load(path: str) -> "StateCache":
-        d = mx.load(path)
-        return StateCache(d["states"], d["pair_index"], d["labels"])
+    def load(path: str, mmap: bool = True) -> "StateCache":
+        """mmap=True (умолчание): состояния читаются страницами с диска, в
+        RAM живёт только то, что реально трогали."""
+        path = str(path)
+        base = path[:-4] if path.endswith(".npy") else path
+        states = np.load(base + ".npy", mmap_mode="r" if mmap else None)
+        idx = np.load(base + ".idx.npz")
+        return StateCache(states, idx["pair_index"], idx["labels"])
 
 
 def _encode_prefix_ids(tokenizer, template: PairTemplate, instruct: str,
@@ -125,6 +179,7 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
                  doc_batch: int = 8,
                  query_batch: int = 16,
                  dtype=mx.float16,
+                 out_path: str = None,
                  verbose: bool = True) -> StateCache:
     """Свернуть все пары (кандидат, запрос) в кэш состояний.
 
@@ -134,8 +189,12 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
     dtype: в чём хранить кэш. fp16 (умолчание) — вдвое меньше fp32 и точнее
     bf16 при том же размере: 10 бит мантиссы против 7. Узкий диапазон fp16
     здесь не мешает — состояния на порядки ниже потолка 65504, и выход за
-    него проверяется явно. fp32 — если хочется без компромиссов, bf16 — если
-    состояния почему-то огромные.
+    него проверяется явно. fp32 — если хочется без компромиссов.
+
+    out_path: писать состояния сразу в .npy на диск (memmap). Тогда кэш не
+    занимает RAM ни при построении, ни при обучении — страницы подтягиваются
+    по обращению. Для кэшей, сравнимых с объёмом памяти, это разница между
+    «работает» и «машина ушла в своп».
     """
     template = template or PairTemplate()
     t0 = time.time()
@@ -171,30 +230,39 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
 
     n_src = len(reranker.head.unique_sources)
     cfg = reranker.base.config
-    # Буфер — numpy на хосте, а не mx.array. Запись `out[rows] = sel` в MLX
-    # это scatter, порождающий новый массив целиком: на кэше в пару гигабайт
-    # это лишние гигабайты транзиентной памяти на КАЖДОЙ пачке. numpy пишет
-    # на месте.
+    # Буфер — numpy, а не mx.array. Запись `out[rows] = sel` в MLX это
+    # scatter, порождающий массив целиком заново: на кэше в пару гигабайт это
+    # лишние гигабайты транзиентной памяти на КАЖДОЙ пачке. numpy пишет на
+    # месте, а с out_path пишет сразу на диск и в RAM не живёт вообще.
+    #
     # fp16 (а не bf16) выбран сознательно: 10 бит мантиссы против 7, а
-    # диапазон здесь заведомо безопасен (состояния 0.1B доходят до ~50 при
-    # потолке fp16 в 65504). Проверка на выход за диапазон — ниже.
+    # диапазон здесь с запасом (состояния 0.1B доходят до ~50 при потолке
+    # 65504). Проверка на выход за диапазон — ниже.
     np_dtype = {mx.float16: np.float16, mx.float32: np.float32}.get(dtype)
-    host = np_dtype is not None
-    if host:
-        out_np = np.zeros((n_pairs, n_src, cfg.n_head, cfg.head_size,
-                           cfg.head_size), dtype=np_dtype)
-        out = None
+    if np_dtype is None:
+        raise ValueError(
+            f"dtype={dtype} не поддерживается кэшем: нужен mx.float16 "
+            "(умолчание) или mx.float32. bf16 у numpy нет, а хранить кэш в "
+            "MLX — значит держать его в памяти целиком."
+        )
+    shape = (n_pairs, n_src, cfg.n_head, cfg.head_size, cfg.head_size)
+    if out_path:
+        out_path = str(out_path)
+        if not out_path.endswith(".npy"):
+            out_path += ".npy"
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        out_np = np.lib.format.open_memmap(out_path, mode="w+",
+                                           dtype=np_dtype, shape=shape)
     else:
-        out_np = None
-        out = mx.zeros((n_pairs, n_src, cfg.n_head, cfg.head_size,
-                        cfg.head_size), dtype=dtype)
+        out_np = np.zeros(shape, dtype=np_dtype)
     max_abs = 0.0
     rows_done = 0
 
     if verbose:
         print(f"пар {n_pairs}, уникальных префиксов {len(prefix_jobs)} "
               f"(экономия {1 - len(prefix_jobs)/max(1,n_pairs):.0%}), "
-              f"кэш {out.nbytes/1e9:.2f} ГБ")
+              f"кэш {out_np.nbytes/1e9:.2f} ГБ"
+              f"{' (memmap на диске)' if out_path else ''}")
 
     for start in range(0, len(prefix_jobs), doc_batch):
         chunk = prefix_jobs[start:start + doc_batch]
@@ -221,15 +289,9 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
             qidx, qmask, qend = _batch_ids(qseqs)
             st_pair = reranker.encode(qidx, mask=qmask, end_idx=qend, state=sub)
             sel = reranker.select(st_pair)                   # [b, n_src, H, S, S]
-            rows = [p[1] for p in part]
-            if host:
-                arr = np.array(sel.astype(mx.float32))
-                max_abs = max(max_abs, float(np.abs(arr).max()))
-                out_np[rows] = arr.astype(np_dtype)
-            else:
-                mx.eval(sel)
-                out[mx.array(np.array(rows, dtype=np.int32))] = sel.astype(dtype)
-                mx.eval(out)
+            arr = np.array(sel.astype(mx.float32))
+            max_abs = max(max_abs, float(np.abs(arr).max()))
+            out_np[[p[1] for p in part]] = arr.astype(np_dtype)
             rows_done += len(part)
 
         if verbose and (start // doc_batch) % 20 == 0:
@@ -239,23 +301,25 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
                   f"пары {rows_done}/{n_pairs} | {el:.0f}s | "
                   f"осталось ~{el/max(1e-9,frac)*(1-frac):.0f}s", flush=True)
 
-    if host:
-        if np_dtype is np.float16 and max_abs > 60000:
-            raise OverflowError(
-                f"состояния доходят до {max_abs:.0f}, fp16 обрежется на 65504. "
-                "Передай dtype=mx.float32 (вдвое больше памяти) или "
-                "dtype=mx.bfloat16 (шире диапазон, грубее мантисса)."
-            )
-        out = mx.array(out_np)
+    if np_dtype is np.float16 and max_abs > 60000:
+        raise OverflowError(
+            f"состояния доходят до {max_abs:.0f}, fp16 обрежется на 65504. "
+            "Передай dtype=mx.float32 (вдвое больше памяти)."
+        )
+    if out_path:
+        out_np.flush()
 
     if verbose:
         print(f"готово за {time.time()-t0:.0f}s, макс|состояние| {max_abs:.1f}")
 
-    return StateCache(
-        states=out,
-        pair_index=mx.array(pair_index),
-        labels=mx.array(np.array([s.label for s in samples], dtype=np.int32)),
+    cache = StateCache(
+        states=out_np,
+        pair_index=pair_index,
+        labels=np.array([s.label for s in samples], dtype=np.int32),
     )
+    if out_path:
+        cache.save(out_path)          # состояния уже на диске, пишутся индексы
+    return cache
 
 
 def encode_pairs_direct(reranker, tokenizer, pairs: Sequence[Tuple[str, str, str]],

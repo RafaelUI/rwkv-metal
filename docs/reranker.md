@@ -274,9 +274,11 @@ from rwkv_metal.reranker import encode_pairs, build_candidates, load_rows
 rows = load_rows("train.jsonl", task="retrieval", limit=1000)
 pool, samples = build_candidates(rows, n_candidates=8)
 cache = encode_pairs(model, tok, pool, samples,
-                     max_doc_tokens=512, max_query_tokens=96)
-cache.save("cache.safetensors")
+                     max_doc_tokens=512, max_query_tokens=96,
+                     out_path="cache.npy")     # пишется прямо на диск
 ```
+
+Reload it later with `StateCache.load("cache.npy")` — memory-mapped by default.
 
 Measured on an M4 Air, 0.1B base, 1000 queries × 8 candidates:
 
@@ -290,6 +292,58 @@ Measured on an M4 Air, 0.1B base, 1000 queries × 8 candidates:
 Practical consequence: hyperparameter search, layer ablations and long
 schedules become free. The expensive part runs once and is reused via
 `--cache_path`.
+
+### The cache lives in numpy, not MLX
+
+`StateCache.states` is a numpy array — optionally a `np.memmap` backed by the
+`.npy` file on disk. Two reasons, both about not running out of memory on a
+16 GB machine:
+
+- **No duplicate.** Scattering batch results into an `mx.array` rebuilds the
+  whole array each time, so a 2.4 GB cache costs gigabytes of transient
+  allocation per batch. numpy writes in place.
+- **It does not have to fit.** With `out_path=` (or `--cache_path`), states are
+  written straight to a memmap and paged in on access. A cache larger than RAM
+  is fine; a cache that *almost* fits is the dangerous case, because the machine
+  swaps and every timing you take afterwards is fiction.
+
+Only the batch crosses into MLX, in its own size: `cache.gather(rows)`.
+
+> **Measure memory with the system, not with MLX.** `mx.get_peak_memory()`
+> reports the MLX pool and knows nothing about numpy buffers, model weights,
+> memory-mapped pages, or whether the machine swapped — and a process that
+> swaps invalidates every timing taken alongside it. On the full run the MLX
+> pool reported 2.29 GB against an actual process RSS of 3.98 GB.
+> `tools/bench_reranker.py` prints process RSS plus the swapin/swapout delta and
+> says outright when a measurement is untrustworthy; for a long run, sample
+> `ps -o rss= -p <pid>` from outside the process.
+>
+> This is not a hypothetical. An early version of `StateCache.save` re-wrote the
+> `.npy` from a memmap of that same file — truncating the file underneath the
+> array it was reading — which drove the process to **11.7 GB** and corrupted
+> the cache. Peak RSS after the fix: **4.0 GB**. Nothing in the MLX counters
+> would have shown it. `tools/test_reranker_smoke.py` now covers the
+> save → memmap-load → re-save cycle.
+
+### `mx.compile`
+
+The head is a few hundred small operations on a single token, so its cost is
+dispatch, not arithmetic. Compiling it (on by default, `RerankTrainConfig.compile`
+and `RerankerInference(compile=True)`):
+
+| | eager | compiled |
+|---|---|---|
+| training step (32 queries × 8 candidates) | 49.1 ms | **34.5 ms** |
+| head forward, 256 pairs | 13.4 ms | **7.1 ms** |
+| base, one token through 12 layers | 10.6 ms | 9.9 ms |
+
+The last row is the interesting one: the base forward barely moves, because it
+is dominated by the WKV kernels and the `D×D` projections rather than by
+dispatch. Compile where the operations are small and numerous, not everywhere.
+
+One trap worth naming: `mx.compile` must be given `inputs=[head.state]`.
+Without it the weights are frozen into the graph on the first call, and every
+subsequent `load_head` or optimiser step silently does nothing.
 
 The catch: the cache is only valid for that base, template, truncation and
 candidate set. Change any of them and it must be rebuilt — `run_reranker.py`
@@ -440,8 +494,11 @@ pool), 150 held-out queries, documents truncated at 512 tokens, 8 epochs,
 | random guessing | 0.222 | 0.125 | — | 0.500 | 0.500 |
 | embedder on the same frozen base | 0.491 | 0.253 | 0.615 | **0.493** | 0.749 |
 | reranker, last layer `(-1,)` | 0.930 | 0.873 | 0.948 | 0.893 | 0.987 |
-| reranker, `(0, 5, 11)` | 0.967 | 0.933 | 0.975 | 0.953 | 0.997 |
-| reranker, middle layer `(5,)` | **0.977** | **0.953** | **0.983** | **0.967** | 0.998 |
+| reranker, middle layer `(5,)` | 0.969 | 0.940 | 0.977 | 0.947 | 0.998 |
+| reranker, `(0, 5, 11)` | **0.975** | **0.953** | **0.981** | **0.953** | 0.997 |
+
+(Single seed. `(5,)` and `(0,5,11)` swap places between runs — see the
+three-seed ablation below, where they are indistinguishable.)
 
 The last two columns are the ones that matter. Overall MRR flatters everyone:
 telling a passage about beekeeping from a passage about steam engines is easy,
@@ -490,12 +547,16 @@ proves them better.
 
 Cost, end to end:
 
-| stage | time |
-|---|---|
-| encoding 8000 pairs (1986 unique prefixes) into a 2.36 GB fp16 cache | ~4.5 min, once |
-| training one head configuration, 8 epochs | 10–31 s |
-| embedder baseline (917 documents + 150 queries) | 1.7 min |
-| **total for three head configurations** | **~7 min**, peak 6.8 GB |
+| stage | time | peak process RSS |
+|---|---|---|
+| encoding 8000 pairs (1986 unique prefixes) into a 2.36 GB fp16 cache | ~4.5 min, once | 1.5 GB |
+| training one head configuration, 8 epochs | 10–30 s | 4.0 GB |
+| embedder baseline (917 documents + 150 queries) | 1.7 min | — |
+| **full run, two head configurations** | **5.3 min** | **4.0 GB** |
+
+Training peaks higher than encoding because it reads random rows across the
+whole cache, so most of the memmap becomes resident — but those are file-backed
+pages the OS can evict, not hard allocations.
 
 Re-running from a saved cache: **1 min** without the embedder baseline. That is
 what makes the ten-variant, three-seed ablation above a thing you run while
@@ -564,20 +625,48 @@ Verified in `tests/test_wkv7_state.py`: a ragged padded batch reproduces
 individual unpadded passes, and a split pass (document, then query from its
 state) reproduces the full pass.
 
-### Not available on `RWKV7`
+### The `RWKV7` token-shift leak (fixed)
 
-The from-scratch pretraining architecture (`rwkv_metal.model.RWKV7`) carries
-token-shift **between blocks**: block `i+1` receives block `i`'s last output as
-its "previous token". That token is in the future relative to position 0, so a
-continuation that matches a straight pass cannot be defined — the value needed
-at the boundary depends on tokens that have not arrived. `RWKV7.body` raises
-`NotImplementedError` for state arguments rather than returning something that
-looks right.
+Building this exposed a bug in the *other* architecture. The from-scratch
+pretraining model (`rwkv_metal.model.RWKV7`) used to carry token-shift **between
+blocks**: block `i+1` received block `i`'s last output as its "previous token".
+That token is in the future relative to position 0, so during teacher-forced
+training the model could see the end of the window while predicting the start —
+and at inference no such token exists, so train and serve disagreed. It also
+made "continue from a saved state" undefinable: the value needed at the boundary
+depends on tokens that have not arrived.
 
-This is worth knowing independently of the reranker: it means the from-scratch
-architecture leaks future information during training. Changing only the last
-token of an input changes hidden states at positions `0..T-2` (measured
-`max|Δh| = 0.30`; the same test on x070 gives exactly `0.0`).
+Measured: changing only the last input token moved earlier hidden states, where
+the same test on x070 gives exactly `0.0`.
+
+**How much did it actually cost?** Less than the description suggests, and the
+honest answer is worth spelling out. The perturbation enters at position 0 of
+each block and walks forward one position per layer, so it touches roughly the
+first `n_layer` positions of the window and nothing else. On a 6-layer model at
+`ctx_len=512`, measured per position:
+
+| position | 0 | 1 | 2 | 3 | 4 | 5 | 6+ |
+|---|---|---|---|---|---|---|---|
+| `max|Δh|` | 0.209 | 0.006 | 0.003 | 0.004 | 0.007 | 0.003 | < 0.002 |
+
+Ten affected positions out of 511. So the effect on average loss is
+negligible — a 400-step from-scratch A/B on 3 M tokens (same seed, same data)
+gave val loss 5.73 legacy versus 5.77 fixed, and re-running the legacy
+checkpoint through the *causal* forward changed its loss by less than 0.001.
+The two runs are within single-run noise of each other.
+
+That is a nice result to be able to state rather than guess at, and it also
+shows where the leak *would* bite: short contexts and deep models, where
+`n_layer / ctx_len` is not 2 % but a fifth.
+
+The reason to fix it was never the loss. It was that train and serve disagreed,
+and that "continue from a saved state" could not be defined. Both architectures
+now zero-pad token-shift per block, both are causal, and both support the full
+state API — `tests/test_wkv7_state.py` checks causality, continuation and ragged
+batching for each. `RWKV7(cfg, legacy_token_shift=True)` (or
+`PretrainConfig(legacy_token_shift=True)`) restores the old behaviour, which you
+only want in order to resume a checkpoint trained before the fix; the state API
+refuses to work in that mode.
 
 ---
 
@@ -631,10 +720,10 @@ token of an input changes hidden states at positions `0..T-2` (measured
 - **The index is memory-hungry.** 2.4 MB per document at 0.1B, fp32. bf16 via
   `build_index(..., dtype=mx.bfloat16)` halves it; the WKV part stays fp32
   because continuation accuracy depends on it.
-- **Fixed per-call overhead.** A forward pass costs ~14 ms of fixed overhead at
-  `B=1` (twelve layers of Python and kernel launches) before any real work.
-  Short-query indexed scoring is dominated by it. `mx.compile` over the head
-  and the continuation path is the obvious next optimisation.
+- **Base-forward dispatch overhead.** Encoding a batch carries ~10 ms of fixed
+  cost at `B=1` (twelve layers of Python and kernel launches) before any real
+  work, and unlike the head this path does **not** respond to `mx.compile`
+  (10.6 → 9.9 ms/token). It is the floor on indexed scoring of short queries.
 - **No cross-encoder distillation.** Training a reranker from a stronger
   teacher's scores is the standard way to get a good one; only the
   positive/negative signal from the dataset is used here.

@@ -193,7 +193,7 @@ def pretrain(cfg: PretrainConfig):
 
     # ── Модель ───────────────────────────────────────────────────────────────
     print("Инициализация модели...")
-    model = RWKV7(cfg)
+    model = RWKV7(cfg, legacy_token_shift=getattr(cfg, "legacy_token_shift", False))
     model._grad_ckpt = cfg.grad_checkpoint
 
     n_params = sum(v.size for _, v in tree_flatten(model.parameters()))
