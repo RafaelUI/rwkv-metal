@@ -1,0 +1,21 @@
+{
+  "stage": "retrieval",
+  "checkpoint": "runs/ru60m_curriculum/embed_retrieval.safetensors",
+  "eval_before": {
+    "mrr": 0.03457641703561092,
+    "recall@1": 0.018,
+    "recall@5": 0.034,
+    "recall@10": 0.054,
+    "ndcg@10": 0.033343273653586906,
+    "n": 500
+  },
+  "eval_after": {
+    "mrr": 0.7251514790452067,
+    "recall@1": 0.646,
+    "recall@5": 0.82,
+    "recall@10": 0.88,
+    "ndcg@10": 0.7586529063563524,
+    "n": 500
+  },
+  "n_eval": 500
+}

@@ -45,7 +45,8 @@ Quick start (LoRA fine-tune of official weights):
 __version__ = "0.1.0"
 
 # ── Models ──────────────────────────────────────────────────────────────────
-from .model import RWKV7, init_weights, RWKV7X070, load_pretrained, lora_ranks
+from .model import (RWKV7, init_weights, RWKV7X070, load_pretrained, lora_ranks,
+                    load_local_rwkv7, load_local_tokenizer)
 
 # ── WKV-7 kernel ──────────────────────────────────────────────────────────────
 from .kernel import (
@@ -80,7 +81,27 @@ from .lora import (
 )
 
 # ── Tokenizer ─────────────────────────────────────────────────────────────────
-from .tokenizer import WorldTokenizer
+from .tokenizer import WorldTokenizer, BPETokenizer
+
+# ── Embedding (inference + contrastive fine-tuning) ──────────────────────────
+from .embedding import (
+    Embedder,
+    embed_texts,
+    EmbeddingModel,
+    EmbedTrainConfig,
+    finetune_embedding,
+    PairBatcher,
+    TripletBatcher,
+    ClassificationBatcher,
+    load_pairs_jsonl,
+    load_triplets_jsonl,
+    retrieval_loss,
+    sts_loss,
+    classification_loss,
+    evaluate_retrieval,
+    evaluate_sts_pairwise,
+    evaluate_classification,
+)
 
 __all__ = [
     "__version__",
@@ -115,4 +136,21 @@ __all__ = [
     "quantize_base_model",
     # tokenizer
     "WorldTokenizer",
+    # embedding
+    "Embedder",
+    "embed_texts",
+    "EmbeddingModel",
+    "EmbedTrainConfig",
+    "finetune_embedding",
+    "PairBatcher",
+    "TripletBatcher",
+    "ClassificationBatcher",
+    "load_pairs_jsonl",
+    "load_triplets_jsonl",
+    "retrieval_loss",
+    "sts_loss",
+    "classification_loss",
+    "evaluate_retrieval",
+    "evaluate_sts_pairwise",
+    "evaluate_classification",
 ]

@@ -13,5 +13,6 @@ BPE); the World tokenizer is only for official x070 weights. They are NOT
 interchangeable.
 """
 from .world_tokenizer import WorldTokenizer, TRIE
+from .bpe_tokenizer import BPETokenizer
 
-__all__ = ["WorldTokenizer", "TRIE"]
+__all__ = ["WorldTokenizer", "TRIE", "BPETokenizer"]

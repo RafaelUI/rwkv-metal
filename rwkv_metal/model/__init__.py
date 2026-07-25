@@ -30,6 +30,7 @@ from .rwkv7 import (
 )
 from .rwkv7_x070 import RWKV7X070, lora_ranks
 from .convert import load_pretrained, save_converted, load_pth, convert
+from .external import load_local_rwkv7, load_local_tokenizer
 
 __all__ = [
     # from-scratch
@@ -46,4 +47,7 @@ __all__ = [
     "save_converted",
     "load_pth",
     "convert",
+    # внешние from-scratch чекпоинты (config.json + model.safetensors)
+    "load_local_rwkv7",
+    "load_local_tokenizer",
 ]

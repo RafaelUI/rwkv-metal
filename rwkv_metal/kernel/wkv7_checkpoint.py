@@ -20,6 +20,19 @@ import mlx.core as mx
 HEAD_SIZE = 64
 CHUNK = 16
 
+# ── Kernel tuning knobs (measured, see experiments/bench_fwd_variants.py and
+#    experiments/bench_bwd_variants.py) ──────────────────────────────────────
+# ACC_FWD / ACC_BWD: split each 64-long dot product into N independent
+#   accumulators. The kernel is latency-bound on dependent FMA chains, not on
+#   ALU throughput or bandwidth (measured: ~0.08 TFLOPS, ~5 GB/s achieved), so
+#   breaking the chains is what buys speed. Reassociates the sums, changing
+#   results by ~4e-8 -- far under the 1e-5 golden-test bar.
+# TILE_BWD: rows of the backward `accum` scratch. 64 = the original single-pass
+#   reduction (18.2 KB threadgroup memory); 16 cuts it to 6.2 KB. Worth ~10%.
+ACC_FWD = 8
+ACC_BWD = 4
+TILE_BWD = 16
+
 _fwd_cache: dict = {}
 _bwd_cache: dict = {}
 
@@ -33,11 +46,22 @@ constant uint T_C         = {T};
 constant uint CHUNK_C     = {CHUNK};
 constant uint N_CHUNKS_C  = {N};
 constant uint H_C         = {H};
+constant uint ACC_C       = {ACC_FWD};
 """
     src = r"""
-    uint dv  = thread_position_in_grid.y;
-    uint bhi = thread_position_in_grid.x;
+    // dv индексирует поток ВНУТРИ threadgroup (запуск: grid=(B*H, D),
+    // threadgroup=(1, D)), поэтому берём thread_position_in_threadgroup --
+    // нужно для стейджинга ниже.
+    uint dv  = thread_position_in_threadgroup.y;
+    uint bhi = threadgroup_position_in_grid.x;
     uint bi  = bhi / H_C, hi = bhi % H_C;
+
+    // a/w/k/b/r одинаковы для всех 64 потоков threadgroup'а: без стейджинга
+    // каждое значение читалось из глобальной памяти 64 раза (по разу на
+    // поток). Замер: это стоило ПОЛОВИНЫ времени forward-ядра.
+    threadgroup float a_sh[HEAD_SIZE_C], w_sh[HEAD_SIZE_C], k_sh[HEAD_SIZE_C];
+    threadgroup float b_sh[HEAD_SIZE_C], r_sh[HEAD_SIZE_C];
+
     float h_row[HEAD_SIZE_C];
     uint hb = (bi*H_C+hi)*HEAD_SIZE_C*HEAD_SIZE_C + dv*HEAD_SIZE_C;
     for (uint dk=0; dk<HEAD_SIZE_C; dk++) h_row[dk] = h_in[hb+dk];
@@ -45,15 +69,36 @@ constant uint H_C         = {H};
     for (uint c=0; c<N_CHUNKS_C; c++) {
         for (uint t=0; t<CHUNK_C; t++) {
             uint base = ((bi*T_C + c*CHUNK_C + t)*H_C + hi)*HEAD_SIZE_C;
-            float sa = 0;
-            for (uint dk=0; dk<HEAD_SIZE_C; dk++) sa += h_row[dk]*a[base+dk];
+
+            a_sh[dv]=a[base+dv]; w_sh[dv]=w[base+dv]; k_sh[dv]=k[base+dv];
+            b_sh[dv]=b[base+dv]; r_sh[dv]=r[base+dv];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ACC_C независимых аккумуляторов вместо одной цепочки из 64
+            // зависимых FMA (ядро latency-bound, см. заметку у ACC_FWD).
+            float sacc[ACC_C];
+            for (uint i=0; i<ACC_C; i++) sacc[i] = 0.0f;
+            for (uint dk=0; dk<HEAD_SIZE_C; dk+=ACC_C)
+                for (uint i=0; i<ACC_C; i++) sacc[i] += h_row[dk+i]*a_sh[dk+i];
+            float sa = 0.0f;
+            for (uint i=0; i<ACC_C; i++) sa += sacc[i];
             sa_out[base+dv] = sa;
+
             float vv = v[base+dv];
             for (uint dk=0; dk<HEAD_SIZE_C; dk++)
-                h_row[dk] = w[base+dk]*h_row[dk] + vv*k[base+dk] + sa*b[base+dk];
-            float y = 0;
-            for (uint dk=0; dk<HEAD_SIZE_C; dk++) y += h_row[dk]*r[base+dk];
+                h_row[dk] = w_sh[dk]*h_row[dk] + vv*k_sh[dk] + sa*b_sh[dk];
+
+            float yacc[ACC_C];
+            for (uint i=0; i<ACC_C; i++) yacc[i] = 0.0f;
+            for (uint dk=0; dk<HEAD_SIZE_C; dk+=ACC_C)
+                for (uint i=0; i<ACC_C; i++) yacc[i] += h_row[dk+i]*r_sh[dk+i];
+            float y = 0.0f;
+            for (uint i=0; i<ACC_C; i++) y += yacc[i];
             out[base+dv] = y;
+
+            // Барьер перед следующей итерацией: соседний t перезапишет *_sh,
+            // пока кто-то ещё читает текущие значения.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         // Сохраняем h-checkpoint после каждого чанка
         uint ckb = ((bi*H_C+hi)*N_CHUNKS_C + c)*HEAD_SIZE_C*HEAD_SIZE_C + dv*HEAD_SIZE_C;
@@ -80,13 +125,18 @@ constant uint T_C         = {T};
 constant uint CHUNK_C     = {CHUNK};
 constant uint N_CHUNKS_C  = {N};
 constant uint H_C         = {H};
+constant uint ACC_C       = {ACC_BWD};
+constant uint TS_C        = {TILE_BWD};
 """
     src = r"""
     uint dv  = thread_position_in_threadgroup.x;
     uint bhi = threadgroup_position_in_grid.x;
     uint bi  = bhi / H_C, hi = bhi % H_C;
 
-    threadgroup float accum[HEAD_SIZE_C][HEAD_SIZE_C];
+    // accum тайлится по индексу потока-источника: [TS_C][64] вместо [64][64].
+    // 64x64 float = 16 КБ threadgroup-памяти на группу из всего 64 потоков;
+    // TS_C=16 срезает это до 4 КБ (+9 векторов = 6.2 КБ против 18.2 КБ).
+    threadgroup float accum[TS_C][HEAD_SIZE_C];
     threadgroup float k_sh[HEAD_SIZE_C], v_sh[HEAD_SIZE_C], r_sh[HEAD_SIZE_C];
     threadgroup float w_sh[HEAD_SIZE_C], a_sh[HEAD_SIZE_C], b_sh[HEAD_SIZE_C];
     threadgroup float dy_sh[HEAD_SIZE_C], sa_sh[HEAD_SIZE_C], dsa_sh[HEAD_SIZE_C];
@@ -94,6 +144,30 @@ constant uint H_C         = {H};
     float C_row[HEAD_SIZE_C], h_row[HEAD_SIZE_C];
     uint hb = (bi*H_C+hi)*HEAD_SIZE_C*HEAD_SIZE_C + dv*HEAD_SIZE_C;
     for (uint dk=0; dk<HEAD_SIZE_C; dk++) C_row[dk] = d_h_out[hb+dk];
+
+    // Транспонирующая редукция out[dv] = sum_s VAL_s[dv], тайлами по TS_C
+    // потоков-источников. Обе фазы держат все 64 потока занятыми: значения
+    // строки считаются из регистров, а суммирование по столбцу ведут все.
+    // ACC_C независимых аккумуляторов разрывают цепочку зависимых FMA.
+#define TILED_REDUCE(RESULT, WRITE_EXPR)                                      \
+    {                                                                         \
+        float _acc[ACC_C];                                                    \
+        for (uint _i=0; _i<ACC_C; _i++) _acc[_i] = 0.0f;                      \
+        for (uint t0 = 0; t0 < HEAD_SIZE_C; t0 += TS_C) {                     \
+            if (dv >= t0 && dv < t0 + TS_C) {                                 \
+                uint loc = dv - t0;                                           \
+                for (uint dk = 0; dk < HEAD_SIZE_C; dk++)                     \
+                    accum[loc][dk] = (WRITE_EXPR);                            \
+            }                                                                 \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                  \
+            for (uint s = 0; s < TS_C; s += ACC_C)                            \
+                for (uint _i = 0; _i < ACC_C; _i++)                           \
+                    _acc[_i] += accum[s+_i][dv];                              \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                  \
+        }                                                                     \
+        RESULT = 0.0f;                                                        \
+        for (uint _i=0; _i<ACC_C; _i++) RESULT += _acc[_i];                   \
+    }
 
     for (int c=(int)N_CHUNKS_C-1; c>=0; c--) {
         // Загружаем точный h-checkpoint для этого чанка
@@ -111,48 +185,46 @@ constant uint H_C         = {H};
             float dy_dv = dy_sh[dv];
             for (uint dk=0; dk<HEAD_SIZE_C; dk++) C_row[dk] += dy_dv*r_sh[dk];
 
-            float dsa_dv=0, dv_val=0;
-            for (uint dk=0; dk<HEAD_SIZE_C; dk++) {
-                dsa_dv += C_row[dk]*b_sh[dk];
-                dv_val  += C_row[dk]*k_sh[dk];
-            }
+            float _dsa[ACC_C], _dvv[ACC_C];
+            for (uint i=0; i<ACC_C; i++) { _dsa[i]=0.0f; _dvv[i]=0.0f; }
+            for (uint dk=0; dk<HEAD_SIZE_C; dk+=ACC_C)
+                for (uint i=0; i<ACC_C; i++) {
+                    _dsa[i] += C_row[dk+i]*b_sh[dk+i];
+                    _dvv[i] += C_row[dk+i]*k_sh[dk+i];
+                }
+            float dsa_dv=0.0f, dv_val=0.0f;
+            for (uint i=0; i<ACC_C; i++) { dsa_dv += _dsa[i]; dv_val += _dvv[i]; }
             dv_out[base+dv] = dv_val;
             dsa_sh[dv] = dsa_dv;
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk] = dy_dv*h_row[dk];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float dr_val=0; for (uint s=0; s<HEAD_SIZE_C; s++) dr_val+=accum[s][dv];
+            // dr использует h_row ДО обновления
+            float dr_val;
+            TILED_REDUCE(dr_val, dy_sh[dv] * h_row[dk])
             dr_out[base+dv] = dr_val;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            // Обновление h делаем всеми потоками сразу (а не внутри тайла),
+            // чтобы к редукции dw оно было завершено у каждого ровно один раз.
             float sa_dv=sa_sh[dv], v_dv=v_sh[dv];
-            for (uint dk=0; dk<HEAD_SIZE_C; dk++) {
-                float hp=(h_row[dk]-v_dv*k_sh[dk]-sa_dv*b_sh[dk])/w_sh[dk];
-                accum[dv][dk]=C_row[dk]*hp; h_row[dk]=hp;
-            }
+            for (uint dk=0; dk<HEAD_SIZE_C; dk++)
+                h_row[dk] = (h_row[dk]-v_dv*k_sh[dk]-sa_dv*b_sh[dk])/w_sh[dk];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            float dw_val=0; for (uint s=0; s<HEAD_SIZE_C; s++) dw_val+=accum[s][dv];
+
+            float dw_val;
+            TILED_REDUCE(dw_val, C_row[dk] * h_row[dk])
             dw_out[base+dv] = dw_val;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk]=C_row[dk]*v_dv;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float dk_val=0; for (uint s=0; s<HEAD_SIZE_C; s++) dk_val+=accum[s][dv];
+            float dk_val;
+            TILED_REDUCE(dk_val, C_row[dk] * v_sh[dv])
             dk_out[base+dv] = dk_val;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk]=dsa_sh[dv]*h_row[dk];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float da_val=0; for (uint s=0; s<HEAD_SIZE_C; s++) da_val+=accum[s][dv];
+            float da_val;
+            TILED_REDUCE(da_val, dsa_sh[dv] * h_row[dk])
             da_out[base+dv] = da_val;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk]=sa_sh[dv]*C_row[dk];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float db_val=0; for (uint s=0; s<HEAD_SIZE_C; s++) db_val+=accum[s][dv];
+            float db_val;
+            TILED_REDUCE(db_val, sa_sh[dv] * C_row[dk])
             db_out[base+dv] = db_val;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             for (uint dk=0; dk<HEAD_SIZE_C; dk++)
                 C_row[dk] = C_row[dk]*w_sh[dk] + dsa_dv*a_sh[dk];
@@ -163,6 +235,7 @@ constant uint H_C         = {H};
         }
     }
     for (uint dk=0; dk<HEAD_SIZE_C; dk++) dh_in_out[hb+dk] = C_row[dk];
+#undef TILED_REDUCE
 """
     kern = mx.fast.metal_kernel(
         name=f"wkv7_ckpt_bwd_H{H}_T{T}",

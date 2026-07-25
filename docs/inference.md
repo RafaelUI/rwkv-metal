@@ -8,6 +8,7 @@ checkpoint produced by [`rwkv-quant`](https://github.com/impulseleap/rwkv-quant)
 - [bf16 inference](#bf16-inference)
 - [Quantized inference (`.rwkvq`)](#quantized-inference-rwkvq)
 - [Choosing bf16 vs quantized](#choosing-bf16-vs-quantized)
+- [Embedding RWKV: extracting vectors](#embedding-rwkv-extracting-vectors)
 - [Current limitations](#current-limitations)
 
 ---
@@ -188,6 +189,58 @@ REDUCTION and COMPRESSION.
 
 ---
 
+## Embedding RWKV: extracting vectors
+
+Inference doesn't have to mean sampling tokens. Because RWKV is an RNN, it folds
+an entire sequence into a fixed-size state, so the hidden state at the last
+position **is** a sentence embedding — no extra head, no training. This is the
+"free sentence embedding" property, and it works on any base checkpoint,
+official World weights included.
+
+```python
+import rwkv_metal as rk
+from rwkv_metal.embedding import Embedder, cosine_similarity_matrix
+
+model, cfg = rk.load_pretrained("weights/RWKV-x070-World-0.1B.pth")
+tok = rk.WorldTokenizer()
+
+emb = Embedder(model, tok)                    # terminator=0, pooling="last"
+vecs = emb(["The cat sits by the window.",
+            "A cat settled on the windowsill.",
+            "The share price fell three percent."])   # [3, D], L2-normalized
+
+print(cosine_similarity_matrix(vecs))         # [3, 3] cosine similarities
+```
+
+`Embedder` runs `model.body(idx)` — everything except the vocab projection — so
+it costs less than a scoring pass, and the `head` weights are never touched.
+Use `embed_texts(model, tok, texts)` for a one-shot call without keeping the
+object.
+
+Two switches:
+
+| Argument | Values | Meaning |
+|---|---|---|
+| `terminator` | int, or `None` | Token appended to every text before pooling, so the pooled position means the same thing across texts. `0` is unmapped in the World vocab, which is what makes it a safe choice there; for a BPE vocab use `BPETokenizer.terminator_id`. |
+| `pooling` | `"last"` / `"mean"` | State at the terminator position, or the mean over all positions. |
+
+Each text gets its own forward pass, so a short text and a long one never share
+a padded batch.
+
+**Untrained quality.** Straight off a base checkpoint, with no fine-tuning,
+vectors already cluster by language and domain: on 21 mixed chunks the 0.1B
+World model gave 0.98–0.99 similarity within Russian agricultural texts,
+0.97–0.99 within English wiki articles with English physics forming its own
+cluster, and 0.89–0.94 for Serbian, separate from both.
+
+That is enough for coarse clustering or deduplication, but it is not a retrieval
+model. Contrastive fine-tuning is what closes that gap — measured on a Russian
+61M base, held-out retrieval MRR goes from 0.035 to 0.725 in 750 steps. The
+training path, the loss functions, the GradCache memory schedule, and advice on
+building the negative pool are all in **[`embedding.md`](./embedding.md)**.
+
+---
+
 ## Current limitations
 
 - **No `model.generate()`.** You assemble the loop yourself (see above). The
@@ -210,4 +263,4 @@ REDUCTION and COMPRESSION.
   "bake the adapter into a smaller quantized file" step yet.
 
 See also: [`lora.md`](./lora.md) for fine-tuning, [`pretraining.md`](./pretraining.md)
-for training from scratch.
+for training from scratch, [`embedding.md`](./embedding.md) for text embeddings.
