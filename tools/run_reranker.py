@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rwkv_metal.model import load_pretrained
 from rwkv_metal.tokenizer import WorldTokenizer
 from rwkv_metal.reranker import (
-    Reranker, RerankerConfig, RerankTrainConfig,
+    Reranker, RerankerConfig, RerankerInference, RerankTrainConfig,
     PairTemplate, StateCache, build_candidates, encode_pairs, evaluate,
     load_rows, resolve_layer_indices, split_train_eval, train_reranker,
 )
@@ -282,9 +282,15 @@ def main():
 
         before = evaluate(model.head, ev)
         ckpt = os.path.join(args.out, f"head_{spec.replace(',', '_')}.safetensors")
+        # контракт подачи текста пишется в чекпоинт вместе с весами: он такая
+        # же часть обученной модели, как и веса, и расходится так же молча
+        serving = RerankerInference(
+            model, tok, max_doc_tokens=args.max_doc_tokens,
+            max_query_tokens=args.max_query_tokens).serving_metadata()
         res = train_reranker(model, tr, ev, RerankTrainConfig(
             lr=args.lr, batch_size=args.batch_size, epochs=args.epochs,
-            loss_alpha=args.loss_alpha, checkpoint_path=ckpt, seed=args.seed))
+            loss_alpha=args.loss_alpha, checkpoint_path=ckpt, seed=args.seed),
+            save_extra=serving)
         after = evaluate(model.head, ev)
         after.update(hard_negative_breakdown(head_scores(model.head, ev), eval_s))
         report["stages"]["configs"][spec] = {

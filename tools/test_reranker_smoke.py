@@ -220,6 +220,25 @@ def main():
               float(mx.abs(s_before - s_after).max()) < 1e-5,
               f"расхождение {float(mx.abs(s_before - s_after).max()):.2e}")
 
+        # ── 5b. чужая конфигурация ловится, своя восстанавливается ───────
+        # Голова над слоем 1 и над слоем 2 совпадают по формам всех тензоров,
+        # поэтому без проверки метаданных подмена прошла бы молча.
+        wrong = Reranker(base, RerankerConfig(layer_idx=(1,)))
+        try:
+            wrong.load_head(ckpt)
+            check("несовпадающая конфигурация отвергается", False,
+                  "загрузилась молча")
+        except ValueError:
+            check("несовпадающая конфигурация отвергается", True)
+
+        model3 = Reranker.from_head(base, ckpt)
+        s3 = batch_scores(model3.head, ev, mx.arange(4))
+        mx.eval(s3)
+        check("from_head восстанавливает конфигурацию",
+              model3.head.layer_idx == model.head.layer_idx
+              and float(mx.abs(s_before - s3).max()) < 1e-5,
+              f"слои {model3.head.layer_idx}")
+
     # ── 4. инференс: прямой путь == индексный ────────────────────────────
     rr = RerankerInference(model, tok, instruct="Найди документ по теме",
                            max_doc_tokens=96, max_query_tokens=48)
@@ -236,6 +255,15 @@ def main():
           all(ranked[i][1] >= ranked[i + 1][1] for i in range(len(ranked) - 1)))
     check("скоры различаются между документами",
           float(np.std(s_direct)) > 1e-6, f"std = {float(np.std(s_direct)):.3e}")
+
+    # ── 4b. индекс с чужой инструкцией отвергается ───────────────────────
+    rr_other = RerankerInference(model, tok, instruct="Совсем другая задача",
+                                 max_doc_tokens=96, max_query_tokens=48)
+    try:
+        rr_other.score_indexed(q, index)
+        check("индекс с чужой инструкцией отвергается", False, "прошло молча")
+    except ValueError:
+        check("индекс с чужой инструкцией отвергается", True)
 
     print()
     print(f"{'ПРОВАЛЕНО: ' + ', '.join(FAILED) if FAILED else 'все проверки пройдены'}")

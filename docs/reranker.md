@@ -63,10 +63,11 @@ import rwkv_metal as rk
 from rwkv_metal.reranker import Reranker, RerankerInference
 
 base, cfg = rk.load_pretrained("weights/rwkv7-g1d-0.1b.pth")
-model = Reranker(base)                       # base is frozen for you
-model.load_head("reranker_head.safetensors") # trained head
 
-rr = RerankerInference(model, rk.WorldTokenizer())
+# reads which layers the head was trained on straight from the checkpoint
+model = Reranker.from_head(base, "reranker_head.safetensors")
+rr = RerankerInference.from_checkpoint(model, rk.WorldTokenizer(),
+                                       "reranker_head.safetensors")
 
 docs = [...]                                  # top-k from your embedder
 for doc_id, score in rr.rank("how do bees overwinter?", docs, top_k=5):
@@ -75,6 +76,20 @@ for doc_id, score in rr.rank("how do bees overwinter?", docs, top_k=5):
 
 Scores are raw logits: comparable **within** one query, not across queries
 unless you trained with a pointwise term (see [Losses](#losses)).
+
+Use `from_head` / `from_checkpoint` rather than constructing by hand. A head
+trained on layer 5 and a head trained on layer 11 have **identical tensor
+shapes**, so loading one into the other's model succeeds silently and produces
+confident nonsense. The checkpoint carries its configuration and the text
+contract (template order, truncation limits, terminator, instruction) in
+safetensors metadata, and `load_head` refuses a mismatch:
+
+```python
+Reranker(base, RerankerConfig(layer_idx=(11,))).load_head(path)
+# ValueError: чекпоинт не соответствует модели: layer_idx='5' в файле против '11' здесь
+```
+
+Pass `strict=False` to load a checkpoint written before this metadata existed.
 
 ### Serving many queries against the same documents
 
@@ -89,8 +104,11 @@ Every later query only pays for its own ~30 tokens. On a 0.1B base this is
 `n_layer · n_head · 64 · 64 · 4` bytes — 2.4 MB per document at 0.1B — so an
 index is for a hot subset (the embedder's top-100), not a whole corpus.
 
-An index is only valid for the base, template and instruction it was built
-with. The state is a function of exactly that prefix.
+An index is only valid for the base, template, truncation and instruction it was
+built with — the state is a function of exactly that prefix. `DocIndex` records
+those and `score_indexed` raises on a mismatch instead of returning plausible
+numbers. The one thing it cannot check is that you swapped the base checkpoint
+underneath it.
 
 ---
 
@@ -197,23 +215,40 @@ model = Reranker(base, RerankerConfig(
 | `n_probe` | `1` | Number of probe tokens. Each is another read of the state; the score comes from the last one. |
 | `head_hidden` | `n_embd` | Hidden width of the scoring MLP. |
 
-`Reranker(base, cfg, freeze_base=True, init_from_base=True)` — the two extra
-flags exist for experiments (training the base too, or starting the head from
-random weights). Both defaults are what you want.
+`Reranker(base, cfg, freeze_base=True, init_from_base=True,
+head_dtype=mx.float32)` — the extra flags exist for experiments. `head_dtype`
+deserves a word: `init_from_base` copies the base's weights as they are, and
+official checkpoints are bf16, so without this the head would *train* in bf16.
+With 8 mantissa bits, weights around 0.05 and `lr ≈ 1e-4`, part of every
+optimiser step falls below the representable quantum and is rounded away. The
+head is 8–23 M parameters, so fp32 costs nothing. Measured effect on this
+benchmark: +0.004 MRR for a one-layer head, nil for a three-layer one — i.e.
+inside the noise. Fixed on principle, not because it showed up.
 
 ### Choosing layers
 
-The last layer is not automatically the best source. The state of layer 11 in
-the 0.1B model is dominated by a large component shared across all documents
-(cos between unrelated documents ≈ 0.996), while middle layers carry
-proportionally more document-specific variation (layer 5 ≈ 0.955, layer 0 ≈
-0.918). Measured effect on held-out MRR is in [Measured results](#measured-results);
-the short version is that a middle layer beats the last one and combining
-layers beats either.
+This is the one choice that measurably matters, and the last layer is not the
+right default. Three seeds each, same cache, same schedule:
 
-Compare configurations cheaply by caching a superset of layers once and slicing
-it per configuration — `tools/run_reranker.py --cache_layers 0,5,11 --configs
--1 5 0,5,11` does exactly this.
+| layers | held-out MRR |
+|---|---|
+| `(0,)` | 0.555 ± 0.011 |
+| `(11,)` — last | 0.922 ± 0.014 |
+| `(5,)` — middle | **0.978 ± 0.004** |
+| `(0, 5, 11)` | 0.976 ± 0.006 |
+
+Layer 0 is barely better than the raw embedder (0.491): its state has not yet
+accumulated anything worth reading. The last layer works but loses ~0.06 MRR to
+the middle one — consistent with the state geometry, where layer 11 is dominated
+by a component shared across all documents (cos ≈ 0.996 between unrelated
+documents, versus 0.955 at layer 5), so the discriminative part is a smaller
+fraction of what the head reads. Combining layers does **not** help here: adding
+layer 0 and layer 11 to layer 5 is within noise of layer 5 alone.
+
+Start from the middle of the stack, and sweep. Comparing is cheap — cache a
+superset of layers once and slice it per configuration:
+`tools/run_reranker.py --cache_layers 0,5,11 --configs -1 5 0,5,11`, or
+`tools/ablate_reranker.py` for multi-seed comparisons on an existing cache.
 
 ---
 
@@ -225,8 +260,11 @@ belong inside the training loop:
 1. **Encode once.** `encode_pairs` folds every `(document, query)` pair into a
    state, reusing the document prefix across all queries that share it.
 2. **Keep only what the head reads.** `RerankerHead.unique_sources` — one layer
-   out of twelve by default: 98 KB per pair in bf16 versus 2.4 MB for a full
-   fp32 state, 25× less.
+   out of twelve by default: 98 KB per pair in fp16 versus 2.4 MB for a full
+   fp32 state, 25× less. (fp16 rather than bf16: same size, 10 mantissa bits
+   instead of 7, and the range is never in question — states peak around 50
+   against an fp16 ceiling of 65504. `encode_pairs` checks and raises rather
+   than silently saturating.)
 3. **Train on the cache.** A step touches only the head: one or two RWKV blocks
    on a single token. An epoch over tens of thousands of pairs takes seconds.
 
@@ -245,8 +283,8 @@ Measured on an M4 Air, 0.1B base, 1000 queries × 8 candidates:
 | | |
 |---|---|
 | unique document prefixes | 1986 out of 8000 pairs (75 % saved by dedup) |
-| encoding | ~7 min, once |
-| cache size | 2.36 GB (3 layers, bf16) |
+| encoding | ~5 min, once |
+| cache size | 2.36 GB (3 layers, fp16) |
 | training | seconds per epoch |
 
 Practical consequence: hyperparameter search, layer ablations and long
@@ -306,10 +344,13 @@ from rwkv_metal.reranker import listwise_loss, bce_loss, mixed_loss
 | `mixed_loss(α)` | `α · listwise + (1-α) · BCE` | use `α < 1` if you need scores comparable **across** queries (thresholding, score fusion) |
 
 `RerankTrainConfig.loss_alpha` selects this; `1.0` (pure listwise) is the
-default.
+default — chosen because it optimises the quantity being measured, **not**
+because it measured better: on this benchmark listwise (0.9781 ± 0.0043), mixed
+(0.9763 ± 0.0050) and pure BCE (0.9733 ± 0.0027) are indistinguishable. Expect
+the difference to appear on a harder candidate set, not here.
 
-Absolute-score calibration is the only reason to keep a pointwise term. If you
-only ever sort candidates within one query, pure listwise is strictly better.
+Absolute-score calibration is the one concrete reason to keep a pointwise term.
+If you only ever sort candidates within a single query, you do not need it.
 
 ---
 
@@ -398,9 +439,9 @@ pool), 150 held-out queries, documents truncated at 512 tokens, 8 epochs,
 |---|---|---|---|---|---|
 | random guessing | 0.222 | 0.125 | — | 0.500 | 0.500 |
 | embedder on the same frozen base | 0.491 | 0.253 | 0.615 | **0.493** | 0.749 |
-| reranker, last layer `(-1,)` | 0.907 | 0.847 | 0.930 | 0.900 | 0.967 |
-| reranker, middle layer `(5,)` | 0.970 | 0.940 | 0.978 | 0.947 | 0.999 |
-| reranker, `(0, 5, 11)` | **0.977** | **0.953** | **0.983** | **0.960** | 0.999 |
+| reranker, last layer `(-1,)` | 0.930 | 0.873 | 0.948 | 0.893 | 0.987 |
+| reranker, `(0, 5, 11)` | 0.967 | 0.933 | 0.975 | 0.953 | 0.997 |
+| reranker, middle layer `(5,)` | **0.977** | **0.953** | **0.983** | **0.967** | 0.998 |
 
 The last two columns are the ones that matter. Overall MRR flatters everyone:
 telling a passage about beekeeping from a passage about steam engines is easy,
@@ -414,36 +455,80 @@ and six of eight candidates are that kind of negative. Split it apart and:
 That gap is what a reranker is for. Both stages use the **same frozen base** —
 the difference is entirely what the head does with the state.
 
-Layer choice matters more than head depth: a middle layer beats the last layer
-by ~0.06 MRR and ~0.05 on hard negatives. Consistent with the state geometry —
-layer 11's state is dominated by a component shared across all documents
-(cos ≈ 0.996 between unrelated documents), so the discriminative part is a
-smaller fraction of it.
+### What actually moves the number
+
+Ten configurations, three seeds each, same cache and schedule
+(`tools/ablate_reranker.py`, held-out MRR):
+
+| variant | MRR |
+|---|---|
+| layer `(5,)`, fp32 head | 0.9781 ± 0.0043 |
+| layer `(5,)`, `shared_state` ×3 blocks | 0.9774 ± 0.0019 |
+| layer `(5,)`, mixed loss α=0.7 | 0.9763 ± 0.0050 |
+| layers `(0,5,11)`, bf16 head | 0.9759 ± 0.0029 |
+| layers `(0,5,11)`, fp32 head | 0.9756 ± 0.0059 |
+| layer `(5,)`, bf16 head | 0.9741 ± 0.0019 |
+| layer `(5,)`, pointwise BCE | 0.9733 ± 0.0027 |
+| layer `(5,)`, 2 probe tokens | 0.9730 ± 0.0028 |
+| layer `(11,)` — last | 0.9219 ± 0.0141 |
+| layer `(0,)` | 0.5552 ± 0.0107 |
+
+Read this the right way. The top eight rows span 0.005 MRR while seed spread
+within a variant is 0.002–0.006 — **they are indistinguishable**. Head depth,
+probe count, listwise vs pointwise loss, fp32 vs bf16 head: none of them are
+resolvable on this benchmark. Only the source layer separates, and it separates
+hugely.
+
+So the honest conclusion is not "listwise beats BCE" (it doesn't, here) but:
+*this task saturates*. 8 candidates, 6 of them randomly sampled, 850 training
+queries — the head reaches the ceiling almost immediately and everything after
+that is noise. Distinguishing these choices needs a harder benchmark: more
+candidates, all of them mined hard negatives, and more data. The defaults chosen
+here (listwise, fp32 head, one probe) are picked on principle — they optimise
+the right objective and don't throw away precision — not because this table
+proves them better.
 
 Cost, end to end:
 
 | stage | time |
 |---|---|
-| encoding 8000 pairs (1986 unique prefixes) into a 2.36 GB bf16 cache | 5.5 min, once |
+| encoding 8000 pairs (1986 unique prefixes) into a 2.36 GB fp16 cache | ~4.5 min, once |
 | training one head configuration, 8 epochs | 10–31 s |
 | embedder baseline (917 documents + 150 queries) | 1.7 min |
-| **total for three head configurations** | **8.1 min**, peak 6.8 GB |
+| **total for three head configurations** | **~7 min**, peak 6.8 GB |
 
-Re-running from a saved cache: **2.7 min**, almost all of it the embedder
-baseline.
+Re-running from a saved cache: **1 min** without the embedder baseline. That is
+what makes the ten-variant, three-seed ablation above a thing you run while
+making coffee rather than a project.
 
-Run-to-run spread with the same flags is about ±0.03 MRR (head initialisation);
-`--seed` fixes it. The ordering between layer configurations held across runs.
+Single-seed spread is ~±0.01 MRR for a good configuration and ~±0.014 for the
+last-layer one; `--seed` fixes the head initialisation, and
+`tools/ablate_reranker.py` averages over seeds.
 
 ### Caveats
 
-- One dataset, one language mix, one base size. LitRetrieval is literary
-  Russian/English prose; nothing here says how this transfers to code, chat logs
+- **The benchmark saturates.** See the ablation above: eight of ten
+  configurations are statistically indistinguishable. Treat these numbers as
+  "the head learns the task quickly and cheaply", not as a ranking of design
+  choices, and not as a quality ceiling.
+- **Six of eight candidates are randomly sampled**, which is why the headline
+  MRR is high. The hard-negative column is the honest one.
+- **Sampled negatives can be false negatives.** A candidate drawn from the pool
+  is another query's positive; nothing checks whether it also answers *this*
+  query. On literary passages collisions are rare, but the metric is optimistic
+  by an unmeasured amount.
+- **Train and eval share the document pool.** The split is by query, so eval
+  queries are unseen, but a document may have been a training positive and
+  appear as an eval negative. The shortcut this would enable ("this document is
+  a positive-ish document") has little predictive value, since every document is
+  a positive for exactly one query — but this has not been measured, and a
+  document-disjoint split would settle it.
+- **One dataset, one language mix, one base size.** LitRetrieval is literary
+  Russian/English prose. Nothing here says how this transfers to code, chat logs
   or short-form web text.
-- Hard negatives come from whatever miner built the dataset. "0.96 against hard
-  negatives" is against *those* negatives.
-- 850 training queries is small. The numbers should be read as "the head learns
-  the task quickly and cheaply", not as a quality ceiling.
+- **Hard negatives come from whatever miner built the dataset.** "0.96 against
+  hard negatives" is against *those* negatives.
+- **850 training queries is small.**
 
 ---
 
@@ -511,7 +596,11 @@ token of an input changes hidden states at positions `0..T-2` (measured
   and the metric stricter. Comparing MRR across different `n_candidates` is
   meaningless — the random floor moves.
 - **The index is per-instruction.** Change the instruction string and the cached
-  prefixes are wrong. There is no checksum guarding this.
+  prefixes are wrong. `score_indexed` catches this; a swapped base checkpoint it
+  cannot catch.
+- **Ablate on a cache, with seeds.** A single run's ±0.01–0.03 will happily
+  "show" you an improvement that isn't there. `tools/ablate_reranker.py` runs
+  variants over several seeds on an existing cache in about a minute each.
 
 ---
 
@@ -526,6 +615,8 @@ token of an input changes hidden states at positions `0..T-2` (measured
 | Negatives | easy/medium/hard sampling per row | shared deduplicated document pool, so extra candidates cost only the query tail |
 | Head init | last layer of the score MLP randomly initialised | zero-init, so the starting loss is exactly `ln(C)` |
 | Probe tokens | 1 | `n_probe`, configurable |
+| Head precision | inherits the base's bf16 | fp32 by default (`head_dtype`) |
+| Checkpoint | weights only | weights + configuration + text contract, verified on load |
 
 ---
 

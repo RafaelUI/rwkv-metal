@@ -124,16 +124,18 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
                  terminator: Optional[int] = 0,
                  doc_batch: int = 8,
                  query_batch: int = 16,
-                 dtype=mx.bfloat16,
+                 dtype=mx.float16,
                  verbose: bool = True) -> StateCache:
     """Свернуть все пары (кандидат, запрос) в кэш состояний.
 
     doc_batch / query_batch подобраны под 16 ГБ unified memory: префиксы
     длинные и держат много активаций, хвосты короткие.
 
-    dtype: в чём хранить кэш. bf16 вдвое меньше fp32; относительная
-    погрешность bf16 (~0.4%) на порядок ниже разброса самих состояний, а
-    голова всё равно приводит вход к fp32 перед рекуррентностью.
+    dtype: в чём хранить кэш. fp16 (умолчание) — вдвое меньше fp32 и точнее
+    bf16 при том же размере: 10 бит мантиссы против 7. Узкий диапазон fp16
+    здесь не мешает — состояния на порядки ниже потолка 65504, и выход за
+    него проверяется явно. fp32 — если хочется без компромиссов, bf16 — если
+    состояния почему-то огромные.
     """
     template = template or PairTemplate()
     t0 = time.time()
@@ -169,8 +171,24 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
 
     n_src = len(reranker.head.unique_sources)
     cfg = reranker.base.config
-    out = mx.zeros((n_pairs, n_src, cfg.n_head, cfg.head_size, cfg.head_size),
-                   dtype=dtype)
+    # Буфер — numpy на хосте, а не mx.array. Запись `out[rows] = sel` в MLX
+    # это scatter, порождающий новый массив целиком: на кэше в пару гигабайт
+    # это лишние гигабайты транзиентной памяти на КАЖДОЙ пачке. numpy пишет
+    # на месте.
+    # fp16 (а не bf16) выбран сознательно: 10 бит мантиссы против 7, а
+    # диапазон здесь заведомо безопасен (состояния 0.1B доходят до ~50 при
+    # потолке fp16 в 65504). Проверка на выход за диапазон — ниже.
+    np_dtype = {mx.float16: np.float16, mx.float32: np.float32}.get(dtype)
+    host = np_dtype is not None
+    if host:
+        out_np = np.zeros((n_pairs, n_src, cfg.n_head, cfg.head_size,
+                           cfg.head_size), dtype=np_dtype)
+        out = None
+    else:
+        out_np = None
+        out = mx.zeros((n_pairs, n_src, cfg.n_head, cfg.head_size,
+                        cfg.head_size), dtype=dtype)
+    max_abs = 0.0
     rows_done = 0
 
     if verbose:
@@ -202,10 +220,16 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
                      for p in part]
             qidx, qmask, qend = _batch_ids(qseqs)
             st_pair = reranker.encode(qidx, mask=qmask, end_idx=qend, state=sub)
-            sel = reranker.select(st_pair).astype(dtype)     # [b, n_src, H, S, S]
-            rows = mx.array(np.array([p[1] for p in part], dtype=np.int32))
-            out[rows] = sel
-            mx.eval(out)
+            sel = reranker.select(st_pair)                   # [b, n_src, H, S, S]
+            rows = [p[1] for p in part]
+            if host:
+                arr = np.array(sel.astype(mx.float32))
+                max_abs = max(max_abs, float(np.abs(arr).max()))
+                out_np[rows] = arr.astype(np_dtype)
+            else:
+                mx.eval(sel)
+                out[mx.array(np.array(rows, dtype=np.int32))] = sel.astype(dtype)
+                mx.eval(out)
             rows_done += len(part)
 
         if verbose and (start // doc_batch) % 20 == 0:
@@ -215,8 +239,17 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
                   f"пары {rows_done}/{n_pairs} | {el:.0f}s | "
                   f"осталось ~{el/max(1e-9,frac)*(1-frac):.0f}s", flush=True)
 
+    if host:
+        if np_dtype is np.float16 and max_abs > 60000:
+            raise OverflowError(
+                f"состояния доходят до {max_abs:.0f}, fp16 обрежется на 65504. "
+                "Передай dtype=mx.float32 (вдвое больше памяти) или "
+                "dtype=mx.bfloat16 (шире диапазон, грубее мантисса)."
+            )
+        out = mx.array(out_np)
+
     if verbose:
-        print(f"готово за {time.time()-t0:.0f}s")
+        print(f"готово за {time.time()-t0:.0f}s, макс|состояние| {max_abs:.1f}")
 
     return StateCache(
         states=out,

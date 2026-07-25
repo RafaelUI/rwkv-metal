@@ -2,7 +2,7 @@
 
 **RWKV-7 on Apple Silicon — pretraining, LoRA/QLoRA, and a custom Metal WKV-7 kernel.**
 
-`rwkv-metal` is [ImpulseLeap](https://impulseleap.com)'s framework for training
+`rwkv-metal` is [ImpulseLeap](https://www.impulseleap.com)'s framework for training
 and fine-tuning [RWKV-7 "Goose"](https://github.com/BlinkDL/RWKV-LM) models on
 Apple Silicon (M-series) using [MLX](https://github.com/ml-explore/mlx). The
 WKV-7 recurrence — the part that doesn't map onto standard ops — runs as a

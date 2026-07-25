@@ -121,7 +121,10 @@ def evaluate(head, cache: StateCache, batch_size: int = 64) -> dict:
 def train_reranker(reranker, train_cache: StateCache,
                    eval_cache: Optional[StateCache] = None,
                    cfg: RerankTrainConfig = None,
-                   on_step: Optional[Callable] = None) -> dict:
+                   on_step: Optional[Callable] = None,
+                   save_extra: Optional[dict] = None) -> dict:
+    """save_extra: дополнительные метаданные в чекпоинт головы — сюда стоит
+    класть контракт подачи текста (`RerankerInference.serving_metadata()`)."""
     cfg = cfg or RerankTrainConfig()
     head = reranker.head
     rng = np.random.default_rng(cfg.seed)
@@ -200,7 +203,7 @@ def train_reranker(reranker, train_cache: StateCache,
         mx.eval(head.parameters())
         print(f"  восстановлены веса лучшей эпохи (held-out MRR {best['mrr']:.3f})")
 
-    reranker.save_head(cfg.checkpoint_path)
+    reranker.save_head(cfg.checkpoint_path, extra=save_extra)
     print("-" * 64)
     print(f"Готово за {time.time()-t0:.0f}s → {cfg.checkpoint_path}")
 

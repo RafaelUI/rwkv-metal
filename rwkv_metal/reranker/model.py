@@ -177,6 +177,26 @@ class RerankerHead(nn.Module):
         mx.eval(self.parameters())
         return self
 
+    def set_dtype(self, dtype):
+        """Привести ВСЕ параметры головы к одному типу.
+
+        Нужно потому, что `init_from_base` копирует веса базы как есть, а
+        официальные чекпоинты лежат в bf16. Без этого голова обучалась бы в
+        bf16, у которого 8 бит мантиссы: при lr порядка 1e-4 и весах порядка
+        0.05 шаг оптимизатора получается меньше кванта представления и
+        просто теряется при округлении. База при этом остаётся в своём типе —
+        она заморожена, и её точность здесь ни при чём.
+        """
+        from mlx.utils import tree_map
+        if isinstance(dtype, str):
+            dtype = {"bfloat16": mx.bfloat16, "bf16": mx.bfloat16,
+                     "float32": mx.float32, "fp32": mx.float32}[dtype]
+        self.update(tree_map(
+            lambda x: x.astype(dtype) if isinstance(x, mx.array) else x,
+            self.parameters()))
+        mx.eval(self.parameters())
+        return self
+
 
 class Reranker(nn.Module):
     """Замороженная база + обучаемая голова.
@@ -187,7 +207,8 @@ class Reranker(nn.Module):
     """
 
     def __init__(self, base: RWKV7X070, rcfg: RerankerConfig = None,
-                 freeze_base: bool = True, init_from_base: bool = True):
+                 freeze_base: bool = True, init_from_base: bool = True,
+                 head_dtype=mx.float32):
         super().__init__()
         if not isinstance(base, RWKV7X070):
             raise TypeError(
@@ -199,6 +220,12 @@ class Reranker(nn.Module):
         self.head = RerankerHead(base.config, self.rcfg, getattr(base, "ranks", None))
         if init_from_base:
             self.head.init_from_base(base)
+        # официальные веса лежат в bf16, и голова унаследовала бы его от базы:
+        # 8 бит мантиссы против 24 у fp32 — часть шагов оптимизатора просто
+        # терялась бы при округлении. Голова маленькая (8-23 М), fp32 ей
+        # ничего не стоит. head_dtype=mx.bfloat16 вернёт прежнее поведение.
+        if head_dtype is not None:
+            self.head.set_dtype(head_dtype)
         if freeze_base:
             self.base.freeze()
 
@@ -225,12 +252,80 @@ class Reranker(nn.Module):
         return self.head(self.encode(idx, mask=mask, end_idx=end_idx, state=state))
 
     # ── Сохранение / загрузка ────────────────────────────────────────────
-    def save_head(self, path: str):
-        from mlx.utils import tree_flatten
-        mx.save_safetensors(path, dict(tree_flatten(self.head.parameters())))
+    #
+    # Конфигурация пишется в metadata чекпоинта не для красоты. Голова из
+    # одного блока над слоем 5 и голова из одного блока над слоем 11 имеют
+    # ОДИНАКОВЫЕ формы всех тензоров: перепутав их, `update()` отработает
+    # молча, а модель будет читать не тот слой и выдавать правдоподобный
+    # мусор. Здесь это ловится на загрузке.
+    def _metadata(self, extra: dict = None) -> dict:
+        md = {
+            "format": "rwkv-metal-reranker-head-v1",
+            "layer_idx": ",".join(str(i) for i in self.head.layer_idx),
+            "shared_state": str(int(self.rcfg.shared_state)),
+            "n_probe": str(self.rcfg.n_probe),
+            "head_hidden": str(self.rcfg.head_hidden or ""),
+            "base_n_layer": str(self.base.config.n_layer),
+            "base_n_embd": str(self.base.config.n_embd),
+            "base_n_head": str(self.base.config.n_head),
+        }
+        if extra:
+            md.update({k: str(v) for k, v in extra.items()})
+        return md
 
-    def load_head(self, path: str):
+    def save_head(self, path: str, extra: dict = None):
+        """extra: произвольные строки в metadata — сюда стоит класть контракт
+        подачи текста (шаблон, обрезки, терминатор, инструкция). Модель о нём
+        не знает, а расходится он так же молча, как и слои."""
+        from mlx.utils import tree_flatten
+        mx.save_safetensors(path, dict(tree_flatten(self.head.parameters())),
+                            metadata=self._metadata(extra))
+
+    def load_head(self, path: str, strict: bool = True):
         from mlx.utils import tree_unflatten
-        self.head.update(tree_unflatten(list(mx.load(path).items())))
+        weights, md = mx.load(path, return_metadata=True)
+        if strict and md.get("format", "").startswith("rwkv-metal-reranker-head"):
+            want = self._metadata()
+            for key in ("layer_idx", "shared_state", "n_probe",
+                        "base_n_layer", "base_n_embd", "base_n_head"):
+                if key in md and md[key] != want[key]:
+                    raise ValueError(
+                        f"чекпоинт не соответствует модели: {key}="
+                        f"{md[key]!r} в файле против {want[key]!r} здесь. "
+                        f"Собери Reranker с той же конфигурацией — проще всего "
+                        f"через Reranker.from_head(base, {path!r})."
+                    )
+        self.head.update(tree_unflatten(list(weights.items())))
         mx.eval(self.head.parameters())
         return self
+
+    @staticmethod
+    def read_head_metadata(path: str) -> dict:
+        """Метаданные чекпоинта без загрузки весов в модель."""
+        _, md = mx.load(path, return_metadata=True)
+        return md
+
+    @classmethod
+    def from_head(cls, base: RWKV7X070, path: str, **kwargs) -> "Reranker":
+        """Собрать реранкер по конфигурации, записанной в самом чекпоинте.
+
+        Рекомендуемый способ загрузки: не нужно помнить, какие слои читала
+        голова и сколько у неё зондов.
+        """
+        md = cls.read_head_metadata(path)
+        if not md.get("format", "").startswith("rwkv-metal-reranker-head"):
+            raise ValueError(
+                f"{path}: нет метаданных реранкера. Это чекпоинт, сохранённый "
+                "старой версией save_head — собери Reranker вручную с нужной "
+                "конфигурацией и вызови load_head(..., strict=False)."
+            )
+        hidden = md.get("head_hidden") or ""
+        rcfg = RerankerConfig(
+            layer_idx=tuple(int(i) for i in md["layer_idx"].split(",")),
+            shared_state=bool(int(md.get("shared_state", "0"))),
+            n_probe=int(md.get("n_probe", "1")),
+            head_hidden=int(hidden) if hidden else None,
+        )
+        model = cls(base, rcfg, **kwargs)
+        model.load_head(path)
+        return model

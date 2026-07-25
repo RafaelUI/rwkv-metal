@@ -31,11 +31,18 @@ from .encode import _batch_ids, _encode_prefix_ids, _encode_suffix_ids
 
 @dataclass
 class DocIndex:
-    """Кэш состояний префиксов. state.batch == len(docs)."""
+    """Кэш состояний префиксов. state.batch == len(docs).
+
+    Поля кроме `state` — не документация, а контракт: состояние это функция
+    ровно от префикса, поэтому индекс, построенный с другой инструкцией или
+    другой обрезкой, — это просто неправильные числа. `score_indexed`
+    сверяется с ними и падает вместо того, чтобы вернуть правдоподобный мусор.
+    """
     state: RWKVState
     docs: List[str]
     instruct: str
     doc_first: bool
+    max_doc_tokens: int = -1
 
     def nbytes(self) -> int:
         return self.state.nbytes()
@@ -58,6 +65,37 @@ class RerankerInference:
         self.max_doc_tokens = max_doc_tokens
         self.max_query_tokens = max_query_tokens
         self.terminator = terminator
+
+    @classmethod
+    def from_checkpoint(cls, reranker, tokenizer, head_path: str, **overrides):
+        """Собрать инференс по контракту, записанному в чекпоинте головы.
+
+        Шаблон, обрезки, терминатор и инструкция — часть того, на чём голова
+        обучалась. Подать текст иначе — не ошибка на уровне форм, а тихая
+        потеря качества, поэтому значения берутся из файла, а не из головы
+        пользователя.
+        """
+        md = reranker.read_head_metadata(head_path)
+        kw = dict(
+            template=PairTemplate(doc_first=bool(int(md.get("doc_first", "1")))),
+            instruct=md.get("instruct", DEFAULT_INSTRUCT),
+            max_doc_tokens=int(md.get("max_doc_tokens", 384)),
+            max_query_tokens=int(md.get("max_query_tokens", 96)),
+            terminator=(None if md.get("terminator", "0") in ("", "None")
+                        else int(md.get("terminator", "0"))),
+        )
+        kw.update(overrides)
+        return cls(reranker, tokenizer, **kw)
+
+    def serving_metadata(self) -> dict:
+        """Контракт подачи текста — то, что стоит положить в save_head(extra=...)."""
+        return {
+            "doc_first": int(self.template.doc_first),
+            "instruct": self.instruct,
+            "max_doc_tokens": self.max_doc_tokens,
+            "max_query_tokens": self.max_query_tokens,
+            "terminator": "" if self.terminator is None else self.terminator,
+        }
 
     # ── Прямой путь ──────────────────────────────────────────────────────
     def score(self, query: str, docs: Sequence[str], instruct: str = None,
@@ -125,12 +163,28 @@ class RerankerInference:
                 print(f"  индекс {start + len(chunk)}/{len(docs)}", flush=True)
         state = RWKVState.concat(parts) if len(parts) > 1 else parts[0]
         return DocIndex(state=state, docs=list(docs), instruct=instruct,
-                        doc_first=self.template.doc_first)
+                        doc_first=self.template.doc_first,
+                        max_doc_tokens=self.max_doc_tokens)
+
+    def _check_index(self, index: DocIndex, instruct: str):
+        if index.doc_first != self.template.doc_first:
+            raise ValueError("индекс построен с другим порядком шаблона")
+        if index.instruct != instruct:
+            raise ValueError(
+                f"индекс построен с инструкцией {index.instruct!r}, "
+                f"а скорится с {instruct!r}: префикс другой, состояния не те"
+            )
+        if index.max_doc_tokens not in (-1, self.max_doc_tokens):
+            raise ValueError(
+                f"индекс построен с max_doc_tokens={index.max_doc_tokens}, "
+                f"сейчас {self.max_doc_tokens}"
+            )
 
     def score_indexed(self, query: str, index: DocIndex,
                       doc_ids: Sequence[int] = None,
-                      batch_size: int = 32) -> np.ndarray:
+                      batch_size: int = 32, instruct: str = None) -> np.ndarray:
         """Скоры запроса против документов индекса (всех или подмножества)."""
+        self._check_index(index, instruct or self.instruct)
         ids = list(range(len(index))) if doc_ids is None else list(doc_ids)
         q_ids = _encode_suffix_ids(self.tok, self.template, "", query,
                                    self.max_query_tokens, self.max_doc_tokens,
@@ -147,10 +201,11 @@ class RerankerInference:
         return np.concatenate(out)
 
     def rank_indexed(self, query: str, index: DocIndex, top_k: int = None,
-                     doc_ids: Sequence[int] = None, batch_size: int = 32
-                     ) -> List[Tuple[int, float]]:
+                     doc_ids: Sequence[int] = None, batch_size: int = 32,
+                     instruct: str = None) -> List[Tuple[int, float]]:
         ids = list(range(len(index))) if doc_ids is None else list(doc_ids)
-        s = self.score_indexed(query, index, doc_ids=ids, batch_size=batch_size)
+        s = self.score_indexed(query, index, doc_ids=ids, batch_size=batch_size,
+                               instruct=instruct)
         order = np.argsort(-s)
         if top_k is not None:
             order = order[:top_k]
