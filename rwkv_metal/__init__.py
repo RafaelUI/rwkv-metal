@@ -42,7 +42,7 @@ Quick start (LoRA fine-tune of official weights):
     finetune(model, batches, LoRAConfig(lr=1e-4, grad_accum=8, max_steps=2000))
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 # ── Models ──────────────────────────────────────────────────────────────────
 from .model import (RWKV7, init_weights, RWKV7X070, load_pretrained, lora_ranks,

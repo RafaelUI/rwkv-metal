@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rwkv-metal"
-version = "0.2.0"
-description = "RWKV-7 on Apple Silicon (Metal/MLX): pretraining, LoRA/QLoRA, and a custom WKV-7 kernel"
+version = "0.3.0"
+description = "RWKV-7 on Apple Silicon (Metal/MLX): pretraining, LoRA/QLoRA, embeddings, reranking, and a custom WKV-7 kernel"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "ImpulseLeap / Alexei Goncharov" }]
-keywords = ["rwkv", "mlx", "metal", "apple-silicon", "llm", "pretraining", "lora"]
+keywords = ["rwkv", "mlx", "metal", "apple-silicon", "llm", "pretraining", "lora",
+            "embeddings", "reranker", "retrieval"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",

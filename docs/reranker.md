@@ -110,6 +110,12 @@ those and `score_indexed` raises on a mismatch instead of returning plausible
 numbers. The one thing it cannot check is that you swapped the base checkpoint
 underneath it.
 
+The indexed and the direct path are the same computation, but not bit-identical:
+splitting the sequence changes the order of accumulation, and official
+checkpoints are bf16. Measured on the 0.1B base, scores agreed to
+`max|Δ| = 0.023` on a score range of about 13 — far below any gap that decides
+an ordering, but do not expect the two paths to match to the last digit.
+
 ---
 
 ## Why the document comes first
@@ -429,6 +435,7 @@ res = train_reranker(model, train_cache, eval_cache, RerankTrainConfig(
 | `lr_schedule` | `"cosine"` | `cosine` / `linear` / `constant`. |
 | `loss_alpha` | `1.0` | See [Losses](#losses). |
 | `temperature` | `1.0` | Divides the logits in the listwise loss. |
+| `compile` | `True` | `mx.compile` over the whole step (grad + clip + update). ~1.4× — see [`mx.compile`](#mxcompile). Turn it off only when debugging, since it makes tracebacks point into the compiled graph. |
 | `eval_every` | `0` | Steps between held-out evaluations; `0` = once per epoch. |
 | `keep_best` | `True` | Restore the weights of the best held-out epoch at the end instead of the last. |
 | `checkpoint_path` | `reranker_head.safetensors` | Only the head is saved — the base is unchanged by definition. |
@@ -466,7 +473,7 @@ constant. `tools/run_reranker.py` reports both.
     --max_doc_tokens 512 \
     --cache_layers 0,5,11 --configs -1 5 0,5,11 \
     --epochs 8 --batch_size 32 --lr 2e-4 \
-    --cache_path runs/reranker_0.1b/cache.safetensors \
+    --cache_path runs/reranker_0.1b/cache \
     --out runs/reranker_0.1b
 ```
 

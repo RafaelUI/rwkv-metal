@@ -126,9 +126,9 @@ and scores the pair, reading straight off the recurrent state.
 ```python
 from rwkv_metal.reranker import Reranker, RerankerInference
 
-model = Reranker(base)                          # base frozen automatically
-model.load_head("reranker_head.safetensors")
-rr = RerankerInference(model, tok)
+# config (which base layers the head reads) is stored in the checkpoint
+model = Reranker.from_head(base, "reranker_head.safetensors")
+rr = RerankerInference.from_checkpoint(model, tok, "reranker_head.safetensors")
 
 for doc_id, score in rr.rank("how do bees overwinter?", docs, top_k=5):
     print(f"{score:+.2f}  {docs[doc_id][:80]}")

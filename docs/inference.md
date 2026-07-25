@@ -406,9 +406,11 @@ numbers are all in **[`reranker.md`](./reranker.md)**.
   at `B=1` on a 0.1B model, almost all of it fixed cost — twelve layers of
   Python dispatch and kernel launches, not arithmetic. Batch your decode or
   wrap the step in `mx.compile` if throughput matters.
-- **State plumbing is x070-only.** `RWKV7` (from-scratch pretraining
-  architecture) cannot support it — see
-  [`reranker.md`](./reranker.md#not-available-on-rwkv7).
+- **`legacy_token_shift=True` has no state support.** Everything else does:
+  both `RWKV7X070` and `RWKV7` are causal and thread state. The legacy flag
+  exists only to reproduce checkpoints trained before the token-shift fix, and
+  in that mode a continuation cannot be defined — see
+  [`reranker.md`](./reranker.md#the-rwkv7-token-shift-leak-fixed).
 - **`emb.weight` is never quantized**, even in the `.rwkvq` path — embedding
   lookup is a gather, not a matmul, so it stays bf16 regardless of preset.
 - **`merge_lora()` doesn't apply to `.rwkvq`-based adapters.** It writes the
