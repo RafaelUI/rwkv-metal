@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.1
+
+A dtype leak in the residual stream, found while porting to Swift and measured
+on both sides.
+
+### Added
+
+- **`CAST_WKV_OUTPUT`** (`rwkv_metal.model.rwkv7_x070`, module flag, **off by
+  default**). The WKV kernel computes its recurrence in float32 — it has to —
+  but it also *returns* float32 into the residual stream, from layer 0 onward.
+  Weights are bfloat16, so every matmul below that point promotes the whole
+  weight matrix to float32. The flag casts the kernel's **output** back to the
+  block's input dtype; `h_out` stays float32, so the recurrence is untouched.
+
+  Measured on 0.1B, A/B interleaved in one process, swap unmoved: decode
+  **15.81 → 5.69 ms/token (2.78×)**, perplexity **18.2512 → 18.2691
+  (+0.098%)** on a mixed-domain Russian/Serbian/English corpus.
+
+  On 1.5B (24 layers) the perplexity cost is **+0.018%** — it *falls* with
+  depth rather than rising, which is the opposite of what was expected. The
+  1.5B timing is not quoted: 3 GB of weights on a 16 GB machine put the run
+  into swap, and the spread (190–216 ms) makes the number meaningless.
+
+  Off by default because this repository is the parity reference for
+  [SwiftRWKV](https://github.com/RafaelUI/SwiftRWKV), where the same flag
+  exists and is also off. Turning it on is a decision to move the numbers on
+  both sides at once.
+
+- **`tests/dev_wkv_cast_ab.py`** — the A/B harness for the flag, with
+  `speed | ppl | both` modes. The modes are separate on purpose: the
+  perplexity pass holds `[T, 65536]` float32 logits (134 MB per chunk at
+  T=512) and pushes a 1.5B run into swap. Swap does not affect perplexity —
+  it is a deterministic number — but it invalidates any timing taken in the
+  same process.
+
+- **`NEXT_SESSION.md`** — working notes on the above: what is measured, under
+  what conditions, and what is left.
+
 ## 0.3.0
 
 Recurrent state becomes a first-class object, and a reranker is built on top of
