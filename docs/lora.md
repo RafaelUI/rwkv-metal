@@ -207,14 +207,20 @@ python -c "
 from rwkv_quant.api import quantize
 quantize('weights/RWKV-x070-World-1.5B.pth', '/tmp/world15b.rwkvq', preset='reduction')
 "
+# optional, see below
 python -m rwkv_quant.formats.export_mlx /tmp/world15b.rwkvq /tmp/world15b.rwkvq_mlx
 ```
 
-`export_mlx` is a one-time step: it repacks the `.rwkvq` (which requires torch
-to read) into a `*.rwkvq_mlx.safetensors` + `.json` sidecar that `rwkv-metal`
-loads with plain `mx.load`, no torch involved from here on.
+**The sidecar is now optional.** It used to be mandatory because `.rwkvq` was a
+torch pickle and the loader layout (K3 interleave) could only be built with
+torch. Neither holds any more: `.rwkvq` is a safetensors container, and
+`rwkv_quant.formats.codec` reads it and builds the interleave in pure numpy —
+so `rwkv-metal` takes the `.rwkvq` directly and stays torch-free. `export_mlx`
+survives as a *cache*: it saves building the interleave at load time, at the
+cost of a second file and about +45 MB on 2.9B. Both paths are checked to give
+bit-identical weights (`tests/dev_rwkvq_direct.py`).
 
-### 2. QLoRA against the sidecar (in `rwkv-metal`)
+### 2. QLoRA against the quantized base (in `rwkv-metal`)
 
 ```python
 import rwkv_metal as rk
@@ -222,7 +228,8 @@ from rwkv_metal.lora import LoRAConfig, finetune
 
 model, cfg, info = rk.lora.load_lora_rwkvq_model(
     "weights/RWKV-x070-World-1.5B.pth",   # shape/name metadata + non-quantized tensors
-    "/tmp/world15b.rwkvq_mlx",            # sidecar path (no extension)
+    "/tmp/world15b.rwkvq",                # the quantized file itself…
+    # "/tmp/world15b.rwkvq_mlx",          # …or a sidecar path (no extension)
     rank=16, alpha=32.0,
     layers=range(12, 24),                 # same speed lever as stock QLoRA
 )
@@ -243,13 +250,13 @@ equivalent entry point if you already have a fully-loaded bf16 model in hand
 
 | `native=` | Mechanism | Measured step time (1.5B, rank 16, top-half layers) | Notes |
 |---|---|---|---|
-| `True` (default) | Repacked into MLX's own `quantized_matmul` | 0.7-0.8s — ties stock QLoRA exactly (same underlying kernel) | Verified only for `bits=6` (REDUCTION); MLX's internal packing differs by bit width |
+| `True` (default) | Repacked into MLX's own `quantized_matmul` | 0.7-0.8s — ties stock QLoRA exactly (same underlying kernel) | MLX's packing rule verified for 4/5/6/8 bits, so both presets work |
 | `False` | Custom fused Metal dequant kernel | 1.2-1.3s | Best memory footprint of the three; bit-width generic (REDUCTION and COMPRESSION both work); doesn't depend on MLX-internal packing details |
 | `"hybrid"` | Native code layout + compact scale/bias unpacked on the fly | 0.8-0.9s | Didn't clearly beat the other two in measurement; kept for reference |
 
 If you want the smallest possible memory footprint, use `native=False`. If you
 want QLoRA training speed to exactly match the stock path while still getting
-`rwkv-quant`'s calibrated accuracy, use `native=True` (REDUCTION only).
+`rwkv-quant`'s calibrated accuracy, use `native=True`.
 
 ### Caveats
 
@@ -260,9 +267,15 @@ want QLoRA training speed to exactly match the stock path while still getting
   base is dequantized on the fly on every call. Keep base + adapter composed
   at inference time; see [`inference.md`](./inference.md#quantized-inference-rwkvq).
   There's no built-in "bake the adapter into a new quantized file" step yet.
-- **`native=True`/`"hybrid"` are only verified for `bits=6`** (the REDUCTION
-  preset's group bit width). If you use COMPRESSION (mixed 4/5-bit groups),
-  use `native=False`.
+- **The old "`native=` only works at `bits=6`" restriction is gone.** It existed
+  because MLX's internal bit packing had only been reverse-engineered at six
+  bits. It has since been checked at 4, 5, 6 and 8 and the rule is the same one
+  everywhere, so COMPRESSION (mixed 4/5-bit groups) works too — see
+  `rwkv-quant/tests/probe_mlx_native_packing.py`. Worth knowing how that check
+  is done, because the obvious way gets it backwards: compare the integer
+  **codes**, not the reconstructed `q*scale + bias`. The latter differs by
+  fp16 rounding inside the kernel and shows 75-81% agreement at *every* bit
+  width, including the one already known to work.
 
 ---
 

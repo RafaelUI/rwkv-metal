@@ -28,7 +28,7 @@ There are two ways to get weights into that model:
 
 | | bf16 | quantized (`.rwkvq`) |
 |---|---|---|
-| Where the weights come from | `.pth` (official World checkpoint) or your own pretrain/finetune output | `rwkv-quant` (separate repo) quantizes a `.pth` into `.rwkvq`, then exports an MLX sidecar |
+| Where the weights come from | `.pth` (official World checkpoint) or your own pretrain/finetune output | `rwkv-quant` (separate repo) quantizes a `.pth` into `.rwkvq`, which is read directly |
 | Loader | `rk.load_pretrained(...)` | `rk.lora.load_lora_rwkvq_model(...)` |
 | Memory | full size (e.g. ~3 GB for World 1.5B) | 2–3× smaller (REDUCTION/COMPRESSION presets) |
 | Dependencies | `rwkv_metal` only | `rwkv_metal` + a one-time `rwkv-quant` export step (torch, run separately — see below) |
@@ -185,17 +185,23 @@ python -c "
 from rwkv_quant.api import quantize
 quantize('weights/RWKV-x070-World-1.5B.pth', '/tmp/world15b.rwkvq', preset='reduction')
 "
-python -m rwkv_quant.formats.export_mlx /tmp/world15b.rwkvq /tmp/world15b.rwkvq_mlx
 ```
 
 `preset` is `"reduction"` (near-zero quality loss, ~2.35× smaller, the
 validated default for a quantized *base* you intend to keep accurate) or
 `"compression"` (~3× smaller, a small but real quality cost — see
 [`lora.md`](./lora.md#qlora-on-a-quantized-rwkvq-base-rwkv-quant) for the
-tradeoff). `export_mlx` is the one place torch is required — it converts the
-`.rwkvq` into a torch-free `*.rwkvq_mlx.safetensors` + `.json` sidecar that
-`rwkv_metal` loads directly. Run it in whatever environment has `rwkv-quant`
-installed; the output sidecar is the only thing `rwkv-metal` needs afterwards.
+tradeoff).
+
+**No export step is needed.** This used to say that `export_mlx` was
+mandatory, because `.rwkvq` was a torch pickle and the loader layout could
+only be built with torch. Both have changed: `.rwkvq` is a safetensors
+container with a self-describing manifest, and `rwkv_quant.formats.codec`
+reads it and builds the loader layout in pure numpy. `rwkv-metal` therefore
+consumes the `.rwkvq` as-is and stays torch-free. `export_mlx` still exists as
+an optional cache — it trades a second file and ~+45 MB on 2.9B for not
+rebuilding the interleave at load; both paths are verified to produce
+bit-identical weights.
 
 ### 2. Load + run (in `rwkv-metal`, torch-free)
 
@@ -204,7 +210,7 @@ import rwkv_metal as rk
 
 model, cfg, info = rk.lora.load_lora_rwkvq_model(
     "weights/RWKV-x070-World-1.5B.pth",   # only used for shape/name metadata + non-quantized tensors
-    "/tmp/world15b.rwkvq_mlx",            # sidecar path (no extension)
+    "/tmp/world15b.rwkvq",                # the quantized file itself, or a sidecar path
     rank=1,                               # see note below — no adapter training happening here
 )
 tok = rk.WorldTokenizer()
