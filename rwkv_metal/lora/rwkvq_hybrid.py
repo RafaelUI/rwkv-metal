@@ -23,7 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .rwkvq_linear import RwkvqLinear
-from .rwkvq_native import _pack_codes_mlx6, GROUP_SIZE, BITS
+from .rwkvq_native import _pack_codes_mlx, GROUP_SIZE
 
 
 def _codes_only(lin: RwkvqLinear) -> np.ndarray:
@@ -50,13 +50,16 @@ class RwkvqHybridLinear(nn.Module):
 
     def __init__(self, lin: RwkvqLinear):
         super().__init__()
-        assert lin.xbits == 2, "bits=6 (xbits=2) required"
+        # ассерт xbits == 2 снят вместе с ограничением, его
+        # породившим: раскладка MLX проверена на 4/5/6/8
         self.out_features, self.in_features = lin.out_features, lin.in_features
         self.NB, self.NSB, self._gw_sb = lin.NB, lin.NSB, lin._gw_sb
 
         codes = _codes_only(lin)
         OUT, NB, _ = codes.shape
-        self.wq = mx.array(_pack_codes_mlx6(codes).reshape(OUT, NB * BITS))
+        self.bits = 4 + lin.xbits
+        self.wq = mx.array(
+            _pack_codes_mlx(codes, self.bits).reshape(OUT, NB * self.bits))
         # компактные scale/bias -- те же буферы, что у fused-кернеля
         self.qsqm = lin.qsqm
         self.ddm = lin.ddm
@@ -84,5 +87,5 @@ class RwkvqHybridLinear(nn.Module):
     def __call__(self, x):
         scale, bias = self._expand_scale_bias()
         return mx.quantized_matmul(x.astype(mx.float32), self.wq, scale, bias,
-                                    transpose=True, group_size=GROUP_SIZE, bits=BITS
+                                    transpose=True, group_size=GROUP_SIZE, bits=self.bits
                                     ).astype(x.dtype)

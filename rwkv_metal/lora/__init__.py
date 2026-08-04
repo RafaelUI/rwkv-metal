@@ -29,7 +29,7 @@ from .lora import (
     TMIX_TARGETS,
     CMIX_TARGETS,
 )
-from .add_rwkvq import add_lora_rwkvq, load_lora_rwkvq_model
+from .add_rwkvq import add_lora_rwkvq, load_lora_rwkvq_model, load_rwkvq_model
 from .rwkvq_linear import RwkvqLinear
 from .finetune import (
     LoRAConfig,
@@ -50,6 +50,7 @@ __all__ = [
     "CMIX_TARGETS",
     "add_lora_rwkvq",
     "load_lora_rwkvq_model",
+    "load_rwkvq_model",
     "RwkvqLinear",
     # high-level fine-tuning
     "LoRAConfig",

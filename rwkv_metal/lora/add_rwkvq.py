@@ -22,6 +22,8 @@ from .lora import LoRALinear, TMIX_TARGETS, _unfreeze_adapters, _param_stats
 from .rwkvq_linear import RwkvqLinear
 from .rwkvq_native import RwkvqNativeLinear
 from .rwkvq_hybrid import RwkvqHybridLinear
+import os
+
 import mlx.core as mx
 
 _TMIX_KEY = {"r_proj": "receptance", "k_proj": "key", "v_proj": "value", "o_proj": "output"}
@@ -101,13 +103,9 @@ def add_lora_rwkvq(model, sidecar_path: str, rank: int = 16, alpha: float = 32.0
     return model, info
 
 
-def _rwkvq_skip_keys(pth_path, tmix_targets, quantize_cmix, quantize_head, layers):
-    """Официальные ключи .pth, которые НЕ нужно материализовывать из
-    bf16 -- они всё равно заменяются RwkvqLinear. n_layer -- дёшево, без
-    чтения тела тензоров (см. convert._load_pth_lazy)."""
-    from ..model.convert import _load_pth_lazy
-    z_lazy = _load_pth_lazy(pth_path)
-    n_layer = 1 + max(int(k.split(".")[1]) for k in z_lazy if k.startswith("blocks."))
+def _skip_keys_for(n_layer, tmix_targets, quantize_cmix, quantize_head, layers):
+    """Официальные ключи, которые НЕ нужно материализовывать из bf16 --
+    они всё равно заменяются RwkvqLinear."""
     sel = set(range(n_layer)) if layers is None else set(i % n_layer for i in layers)
     skip = set()
     for i in sel:
@@ -119,6 +117,68 @@ def _rwkvq_skip_keys(pth_path, tmix_targets, quantize_cmix, quantize_head, layer
     if quantize_head:
         skip.add("head.weight")
     return skip, n_layer
+
+
+def _rwkvq_skip_keys(pth_path, tmix_targets, quantize_cmix, quantize_head, layers):
+    """То же по .pth: n_layer берётся из pickle-метаданных, дёшево, без
+    чтения тела тензоров (см. convert._load_pth_lazy)."""
+    from ..model.convert import _load_pth_lazy
+    z_lazy = _load_pth_lazy(pth_path)
+    n_layer = 1 + max(int(k.split(".")[1]) for k in z_lazy
+                      if k.startswith("blocks."))
+    return _skip_keys_for(n_layer, tmix_targets, quantize_cmix,
+                          quantize_head, layers)
+
+
+def load_rwkvq_model(rwkvq_path, rank: int = 16, alpha: float = 32.0,
+                     dropout: float = 0.0, tmix_targets=TMIX_TARGETS,
+                     quantize_cmix: bool = True, quantize_head: bool = True,
+                     layers=None, config=None, verbose: bool = True,
+                     native: bool = True):
+    """QLoRA-модель ИЗ ОДНОГО .rwkvq. Ни .pth, ни сайдкара не нужно.
+
+    Прежний вход (load_lora_rwkvq_model) требовал .pth ради тензоров,
+    которых нет в сайдкаре: нормировок, token-shift миксов, LoRA-веток,
+    эмбеддингов. На 2.9B это 5.9 ГБ ради ~2% тензоров. Полный экспорт
+    убрал причину: в .rwkvq лежит всё.
+
+    Чем платим -- измерено: неквантованные ветки приезжают
+    деквантованными, база сдвигается на +0.118% ppl на 1.5B и +0.145%
+    на 2.9B, две трети сдвига даёт g_lora
+    (rwkv-quant/tests/ablate_qlora_lora_source.py). Прежний вход
+    оставлен для случая, когда этот сдвиг неприемлем.
+    """
+    from ..model.convert import load_pretrained_rwkvq
+    from rwkv_quant.formats import codec
+
+    manifest, _ = codec.open_rwkvq(os.path.expanduser(rwkvq_path))
+    skip_keys, _ = _skip_keys_for(manifest["n_layer"], tmix_targets,
+                                  quantize_cmix, quantize_head, layers)
+
+    wrapped_holder = []
+
+    def hook(m):
+        wrapped_holder.extend(_replace_targets_with_rwkvq(
+            m, rwkvq_path, rank, alpha, dropout, tmix_targets,
+            quantize_cmix, quantize_head, layers, native=native))
+
+    model, cfg = load_pretrained_rwkvq(rwkvq_path, skip_keys, config=config,
+                                       verbose=verbose,
+                                       pre_materialize_hook=hook)
+    if model is None:
+        raise RuntimeError("load_pretrained_rwkvq: конверсия не чистая")
+
+    model.freeze()
+    _unfreeze_adapters(model)
+    mx.eval(model.parameters())
+
+    info = _param_stats(model)
+    info["wrapped_per_block"] = sorted(set(wrapped_holder))
+    info["num_lora_adapters"] = len(wrapped_holder)
+    info["quantize_cmix"] = quantize_cmix
+    info["quantize_head"] = quantize_head
+    info["source"] = "rwkvq-only"
+    return model, cfg, info
 
 
 def load_lora_rwkvq_model(pth_path, sidecar_path, rank: int = 16, alpha: float = 32.0,

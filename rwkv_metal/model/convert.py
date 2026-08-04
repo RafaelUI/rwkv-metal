@@ -9,7 +9,7 @@ load_pth() материализует ВСЁ сразу (как раньше). _
 пик памяти загрузки (~2.3x размера файла, см. NEXT_SESSION QLoRA-заметки)
 за данные, которые тут же выбрасываются.
 """
-import io, zipfile, pickle
+import io, os, zipfile, pickle
 import numpy as np
 import mlx.core as mx
 from collections import OrderedDict
@@ -138,6 +138,120 @@ def convert(z, n_layer, H, S):
         out[b + 'cmix.key.weight'] = z[ffn + 'key.weight']
         out[b + 'cmix.value.weight'] = z[ffn + 'value.weight']
     return out
+
+
+class _Skipped:
+    """Заглушка для тензора, который материализовать не будут.
+
+    `convert()` строит полный словарь имён и обращается к КАЖДОМУ ключу,
+    даже если ниже он будет пропущен. Класть туда настоящий вес ради
+    того, чтобы его выбросить, -- ровно тот расход, от которого мы
+    уходим; поэтому здесь только форма."""
+    __slots__ = ("shape",)
+
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+
+
+def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
+                          verbose=True, pre_materialize_hook=None):
+    """Как load_pretrained_partial(), но ИСТОЧНИК -- сам .rwkvq, без .pth.
+
+    Зачем. Прежде квантованная база требовала ДВА файла: .rwkvq с
+    большими матрицами и .pth ради всего остального -- нормировок,
+    token-shift миксов, low-rank LoRA-веток, эмбеддингов. На 2.9B это
+    5.9 ГБ, которые качались и читались только чтобы взять из них ~2%
+    тензоров. С тех пор как экспорт стал полным, в .rwkvq есть ВСЁ, и
+    второй файл не нужен.
+
+    Цена измерена, а не предположена: неквантованные ветки приезжают
+    деквантованными, и база сдвигается на +0.118% ppl на 1.5B и +0.145%
+    на 2.9B (rwkv-quant/tests/ablate_qlora_lora_source.py). Две трети
+    сдвига даёт g_lora; если он окажется дорог, собирайте .rwkvq с
+    g_lora=16.
+
+    Читается через rwkv_quant.formats.codec -- numpy, без torch.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten, tree_unflatten
+    from rwkv_quant.formats import codec
+    from ..pretrain.config import PretrainConfig
+    from .rwkv7_x070 import RWKV7X070
+
+    manifest, buf = codec.open_rwkvq(os.path.expanduser(rwkvq_path))
+    n_layer = manifest["n_layer"]
+    D, S, V = manifest["n_embd"], manifest["head_size"], manifest["vocab_size"]
+    H = D // S
+    if verbose:
+        print(f"rwkvq config: n_layer={n_layer} D={D} H={H} S={S} vocab={V} "
+              f"(из манифеста, а не из форм -- формат самоописан)")
+
+    if config is None:
+        config = PretrainConfig(
+            n_layer=n_layer, n_embd=D, vocab_size=V, head_size=S,
+            ctx_len=512, batch_size=1,
+            train_data="", val_data="", max_steps=1,
+        )
+
+    m = RWKV7X070(config)
+
+    # z: официальные (world) имена -> значения.
+    #
+    # Заглушка ставится ТОЛЬКО тем sb6-тензорам, которые перечислены в
+    # skip_official_keys, то есть которые хук заменит на RwkvqLinear.
+    # Прочие sb6 -- например слои вне `layers=` -- обязаны быть
+    # развёрнуты: иначе они останутся со случайной инициализацией из
+    # RWKV7X070.__init__ и модель будет считать правдоподобную чушь.
+    # Ровно это и произошло в первой версии; поймал гейт
+    # tests/dev_rwkvq_only_vs_pth.py, сверяющий веса послойно, а не
+    # логиты (по логитам это выглядело бы просто "квантование шумит").
+    skip_set = set(skip_official_keys)
+    z, n_deq = {}, 0
+    for key, meta in manifest["tensors"].items():
+        if meta["kind"] == "sb6" and key in skip_set:
+            z[key] = _Skipped(meta["shape"])
+            continue
+        w = codec.dequant_key(manifest, buf, key)
+        z[key] = mx.array(w).astype(mx.bfloat16)
+        n_deq += 1
+    if verbose:
+        print(f"деквантовано {n_deq} тензоров, sb6 оставлено заглушками "
+              f"{len(z) - n_deq}")
+
+    conv_lazy = convert(z, n_layer, H, S)
+
+    model_keys = set(k for k, _ in tree_flatten(m.parameters()))
+    conv_keys = set(conv_lazy.keys())
+    miss, extra = model_keys - conv_keys, conv_keys - model_keys
+    if miss or extra:
+        print(f"!!! conversion is NOT clean - aborting "
+              f"(missing {sorted(miss)[:5]}, extra {sorted(extra)[:5]})")
+        return None, config
+
+    if pre_materialize_hook is not None:
+        pre_materialize_hook(m)
+
+    skip_official_keys = skip_set
+    conv = {}
+    for key, val in conv_lazy.items():
+        official = _internal_to_official(key, n_layer)
+        if official in skip_official_keys or isinstance(val, _Skipped):
+            continue
+        conv[key] = val
+
+    params = dict(tree_flatten(m.parameters()))
+    bad = [(k, tuple(conv[k].shape), tuple(params[k].shape))
+           for k in conv if tuple(conv[k].shape) != tuple(params[k].shape)]
+    if bad:
+        print(f"!!! shape mismatches: {bad[:5]} - aborting")
+        return None, config
+
+    if verbose:
+        print(f"materialized {len(conv)} tensors, "
+              f"skipped {len(conv_lazy) - len(conv)}")
+    m.update(tree_unflatten(list(conv.items())))
+    mx.eval(m.parameters())
+    return m, config
 
 
 def load_pretrained(pth_path, config=None, verbose=True):

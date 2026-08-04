@@ -208,9 +208,8 @@ bit-identical weights.
 ```python
 import rwkv_metal as rk
 
-model, cfg, info = rk.lora.load_lora_rwkvq_model(
-    "weights/RWKV-x070-World-1.5B.pth",   # only used for shape/name metadata + non-quantized tensors
-    "/tmp/world15b.rwkvq",                # the quantized file itself, or a sidecar path
+model, cfg, info = rk.lora.load_rwkvq_model(
+    "/tmp/world15b.rwkvq",                # one file, nothing else
     rank=1,                               # see note below — no adapter training happening here
 )
 tok = rk.WorldTokenizer()

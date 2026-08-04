@@ -226,12 +226,34 @@ bit-identical weights (`tests/dev_rwkvq_direct.py`).
 import rwkv_metal as rk
 from rwkv_metal.lora import LoRAConfig, finetune
 
+# One file, nothing else:
+model, cfg, info = rk.lora.load_rwkvq_model(
+    "/tmp/world15b.rwkvq",
+    rank=16, alpha=32.0,
+    layers=range(12, 24),                 # same speed lever as stock QLoRA
+)
+```
+
+The `.pth` used to be required alongside the quantized file, for the tensors a
+sidecar never carried: normalisations, token-shift multipliers, the low-rank
+lora branches, embeddings. On 2.9B that is 5.9 GB fetched and read to obtain
+about 2% of the tensors. Since the export became complete, `.rwkvq` holds all
+of them and `load_rwkvq_model` needs nothing else.
+
+What it costs is measured rather than assumed: those branches now arrive
+dequantised, which moves the frozen base by **+0.118% ppl at 1.5B and +0.145%
+at 2.9B**, two thirds of it from `g_lora`
+(`rwkv-quant/tests/ablate_qlora_lora_source.py`). If that matters for your run,
+quantise with `g_lora=16` — or keep using the two-file entry point below, which
+is unchanged:
+
+```python
 model, cfg, info = rk.lora.load_lora_rwkvq_model(
     "weights/RWKV-x070-World-1.5B.pth",   # shape/name metadata + non-quantized tensors
     "/tmp/world15b.rwkvq",                # the quantized file itself…
     # "/tmp/world15b.rwkvq_mlx",          # …or a sidecar path (no extension)
     rank=16, alpha=32.0,
-    layers=range(12, 24),                 # same speed lever as stock QLoRA
+    layers=range(12, 24),
 )
 print(f"trainable: {info['trainable_pct']:.3f}%")
 

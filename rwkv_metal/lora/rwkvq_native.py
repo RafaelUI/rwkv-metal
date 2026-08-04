@@ -78,37 +78,35 @@ def _codes_scale_bias(lin: RwkvqLinear):
     return np.array(q.reshape(OUT, NB, 32)), np.array(scale), np.array(bias)
 
 
-def _pack_codes_mlx6(codes32: np.ndarray) -> np.ndarray:
-    """codes32: [..., 32] int (0..63) -> [..., 6] uint32, нативная
-    упаковка mx.quantize(bits=6, group_size=32)."""
-    lead = codes32.shape[:-1]
-    words = np.zeros((*lead, 6), dtype=np.uint32)
-    codes = codes32.astype(np.uint32)
-    for p in range(32):
-        bit_start = p * 6
-        w0 = bit_start // 32
-        off0 = bit_start % 32
-        bits_in_w0 = min(6, 32 - off0)
-        bits_in_w1 = 6 - bits_in_w0
-        code_p = codes[..., p]
-        words[..., w0] |= ((code_p & ((1 << bits_in_w0) - 1)) << off0).astype(np.uint32)
-        if bits_in_w1 > 0:
-            words[..., w0 + 1] |= ((code_p >> bits_in_w0) & ((1 << bits_in_w1) - 1)).astype(np.uint32)
-    return words
+def _pack_codes_mlx(codes32: np.ndarray, bits: int) -> np.ndarray:
+    """codes32: [..., 32] -> [..., bits] uint32, раскладка
+    mx.quantize(group_size=32).
+
+    Реализация делегирована в rwkv_quant.formats.codec: там она одна на
+    все три репозитория и покрыта гейтом на 4/5/6/8 бит. Прежняя копия
+    здесь была захардкожена под шесть и породила ассерт `xbits == 2`,
+    который жил дольше, чем ограничение, его вызвавшее."""
+    from rwkv_quant.formats import codec
+    return codec.pack_mlx_affine(codes32, bits)
 
 
 class RwkvqNativeLinear(nn.Module):
     """Frozen linear на РОДНОМ MLX quantized_matmul поверх перепакованных
     sb6-данных. y = quantized_matmul(x, wq, scale, bias, transpose=True).
-    Однократная перепаковка при конструировании (не на каждый forward)."""
+    Однократная перепаковка при конструировании (не на каждый forward).
+
+    Работает на ЛЮБОЙ битности sb6 (4/5/6), то есть и на COMPRESSION.
+    Прежде здесь стоял ассерт `xbits == 2`, потому что раскладка MLX
+    была реверс-инжинирена только для шести бит; проверка на 4/5/6/8
+    показала, что правило одно и то же."""
 
     def __init__(self, lin: RwkvqLinear):
         super().__init__()
-        assert lin.xbits == 2, "bits=6 (xbits=2) required -- см. докстринг модуля"
         self.out_features, self.in_features = lin.out_features, lin.in_features
+        self.bits = 4 + lin.xbits
         codes, scale, bias = _codes_scale_bias(lin)
         OUT, NB, _ = codes.shape
-        wq_np = _pack_codes_mlx6(codes).reshape(OUT, NB * BITS)
+        wq_np = _pack_codes_mlx(codes, self.bits).reshape(OUT, NB * self.bits)
         self.wq = mx.array(wq_np)
         self.scale = mx.array(scale)
         self.bias = mx.array(bias)
@@ -120,5 +118,5 @@ class RwkvqNativeLinear(nn.Module):
 
     def __call__(self, x):
         return mx.quantized_matmul(x.astype(mx.float32), self.wq, self.scale, self.bias,
-                                    transpose=True, group_size=GROUP_SIZE, bits=BITS
-                                    ).astype(x.dtype)
+                                    transpose=True, group_size=GROUP_SIZE,
+                                    bits=self.bits).astype(x.dtype)
