@@ -2,18 +2,24 @@
 QLoRA-база на РОДНОМ формате rwkv-quant (.rwkvq, gw_mode="sb6"), а не на
 стоковом mlx.nn.quantize.
 
-Почему отдельный модуль: .rwkvq требует torch для чтения (rwkv_quant/
-formats/reader.py), а rwkv-metal намеренно torch-free в рантайме (см.
-model/convert.py). Поэтому конвертация в две стадии:
-  1) rwkv_quant.formats.export_mlx (venv rwkv-quant, есть torch) -- один раз
-     переупаковывает .rwkvq в *.rwkvq_mlx.safetensors + .json манифест,
-     используя K3-интерлив-буферы (qblk/qsqm/ddm) из
-     backends/metal/quant_linear_gw.py::GwQuantLinear -- те же буферы,
-     что и в проверенном бит-в-бит инференс-пути.
-  2) этот модуль (venv rwkv-metal, БЕЗ torch) грузит сайдкар через
-     mx.load + json и восстанавливает dense-вес НА ЛЕТУ при каждом
-     forward (транзиент, не кешируется -- смысл QLoRA: база должна жить
-     в памяти в сжатом виде, а не dense).
+ОДНА СТАДИЯ ВМЕСТО ДВУХ (05.08). Раньше здесь было написано, что
+.rwkvq требует torch, а потому нужен промежуточный сайдкар: export_mlx
+(в venv rwkv-quant, где torch есть) перекладывал файл в
+*.rwkvq_mlx.safetensors + .json, и уже его читал этот модуль. Оба
+утверждения устарели:
+
+  - `rwkv_quant.formats.codec` читает контейнер и строит K3-интерлив на
+    numpy, без torch (гейт rwkv-quant/tests/test_torch_free_import.py);
+  - `load_sidecar` принимает и .rwkvq напрямую, и прежний сайдкар.
+
+Сайдкар остался НЕОБЯЗАТЕЛЬНЫМ кешем: он экономит построение интерлива
+при загрузке, но стоит отдельного файла и +45 МБ на 2.9B. Что оба пути
+дают бит-в-бит одно и то же, проверяет tests/dev_rwkvq_direct.py
+(453.5M элементов на 2.9B, расхождений нет).
+
+Dense-вес по-прежнему восстанавливается НА ЛЕТУ при каждом forward
+(транзиент, не кешируется -- смысл QLoRA: база должна жить в памяти
+сжатой). Для ИНФЕРЕНСА этот размен другой, см. rwkvq_native.py.
 
 Точность: dequant делается в float32 (НЕ float16, в отличие от
 GwQuantLinear._dequant_w(), который держит математику в half ради
@@ -33,6 +39,8 @@ launch вместо ~8 отдельных MLX-операций. Замерено
 кернеле.
 """
 import json
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 from .rwkvq_kernel import dequant_dense
@@ -40,13 +48,60 @@ from .rwkvq_kernel import dequant_dense
 _SIDECAR_CACHE = {}
 
 
+def _load_rwkvq_direct(path: str):
+    """`.rwkvq` -> те же (arrays, manifest), что даёт сайдкар.
+
+    Сайдкар больше не нужен: `rwkv_quant.formats.codec` умеет и читать
+    контейнер, и строить K3-интерлив, и всё это на numpy без torch
+    (проверено гейтом test_torch_free_import). Раньше промежуточный файл
+    был обязателен только потому, что интерлив умел строить лишь
+    export_mlx через torch.
+
+    K3 строится для ВСЕХ sb6-тензоров сразу, а не лениво по ключу: это
+    ровно та память, которую занимал сайдкар (1.8 ГБ на 2.9B), и
+    усложнять ради отложенной сборки нечего.
+    """
+    from rwkv_quant.formats import codec
+
+    manifest, buf = codec.open_rwkvq(path)
+    arrays, tensors = {}, {}
+    for key, meta in manifest["tensors"].items():
+        if meta["kind"] != "sb6":
+            continue
+
+        def b(field):
+            return buf.get(f"{key}::{field}")
+
+        qblk, qsqm, ddm, xbits = codec.sb6_to_k3(
+            b("codes_packed"), b("gw_qsqm"), b("gw_d"), b("gw_dm"),
+            shape=tuple(meta["shape"]), gs=meta["gw_gs"], sb=meta["gw_sb"],
+            nb=meta.get("n_blocks"), qh=b("gw_qh"), qh2=b("gw_qh2"))
+        arrays[f"{key}::qblk"] = mx.array(qblk)
+        arrays[f"{key}::qsqm"] = mx.array(qsqm)
+        arrays[f"{key}::ddm"] = mx.array(ddm)
+        # xbits в манифесте .rwkvq нет: там он выводится из наличия
+        # битплоскостей, а сайдкар хранил его явно. Проставляем, чтобы
+        # потребители не различали источник.
+        tensors[key] = dict(meta, xbits=xbits)
+    mx.eval(*arrays.values())
+    return arrays, dict(manifest, tensors=tensors)
+
+
 def load_sidecar(path: str):
-    """path -- без суффикса .safetensors/.json (как передан в export_mlx)."""
+    """Квантованная база: `.rwkvq` НАПРЯМУЮ либо прежний сайдкар.
+
+    path -- либо путь к `.rwkvq`, либо сайдкар без суффикса
+    .safetensors/.json (как его кладёт export_mlx). Различается по
+    расширению и по наличию файлов, чтобы прежние вызовы работали без
+    правок."""
     if path in _SIDECAR_CACHE:
         return _SIDECAR_CACHE[path]
-    arrays = mx.load(path + ".safetensors")
-    with open(path + ".json") as f:
-        manifest = json.load(f)
+    if path.endswith(".rwkvq") or not os.path.exists(path + ".safetensors"):
+        arrays, manifest = _load_rwkvq_direct(path)
+    else:
+        arrays = mx.load(path + ".safetensors")
+        with open(path + ".json") as f:
+            manifest = json.load(f)
     _SIDECAR_CACHE[path] = (arrays, manifest)
     return arrays, manifest
 
