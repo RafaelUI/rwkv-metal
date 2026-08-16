@@ -45,6 +45,15 @@ import mlx.core as mx
 import mlx.nn as nn
 from .rwkvq_kernel import dequant_dense
 
+# ЕДИНЫЙ СПИСОК КВАНТОВАННЫХ РАСКЛАДОК. Их перечисляют ТРИ места: этот
+# загрузчик, диспетчер бэкендов (add_rwkvq._backend_for) и конвертер
+# (model/convert.py), который по нему решает, ставить заглушку или
+# деквантовать. Пока список был один ("sb6"), расхождение было
+# невозможно; с приходом sym конвертер отстал -- и молча разворачивал всю
+# базу в плотный bf16 (145 тензоров, +5.4 ГБ пика, время сборки x5) при
+# том, что логиты оставались верными до бита. Поэтому список ровно один.
+QUANTIZED_KINDS = ("sb6", "sym")
+
 _SIDECAR_CACHE = {}
 
 
@@ -67,7 +76,7 @@ def _load_rwkvq_direct(path: str):
     arrays, tensors, syms = {}, {}, {}
     for key, meta in manifest["tensors"].items():
         kind = meta.get("kind")
-        if kind not in ("sb6", "sym"):
+        if kind not in QUANTIZED_KINDS:
             continue
 
         def b(field):
