@@ -153,11 +153,6 @@ class _Skipped:
         self.shape = tuple(shape)
 
 
-# Раскладки, которые бэкенд умеет держать сжатыми (см. lora/rwkvq_linear).
-# Всё прочее из .rwkvq приезжает деквантованным.
-_QUANTIZED_KINDS = ("sb6", "sym")
-
-
 def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
                           verbose=True, pre_materialize_hook=None):
     """Как load_pretrained_partial(), но ИСТОЧНИК -- сам .rwkvq, без .pth.
@@ -210,6 +205,7 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
     # Ровно это и произошло в первой версии; поймал гейт
     # tests/dev_rwkvq_only_vs_pth.py, сверяющий веса послойно, а не
     # логиты (по логитам это выглядело бы просто "квантование шумит").
+    from ..lora.rwkvq_linear import QUANTIZED_KINDS
     skip_set = set(skip_official_keys)
     z, n_deq = {}, 0
     for key, meta in manifest["tensors"].items():
@@ -220,7 +216,7 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
         # плотный bf16 целиком (145 тензоров, ~6 ГБ транзиентов) ради
         # того, чтобы хук тут же заменил её квантованными модулями.
         # По логитам это не видно вовсе -- только по пику памяти.
-        if meta["kind"] in _QUANTIZED_KINDS and key in skip_set:
+        if meta["kind"] in QUANTIZED_KINDS and key in skip_set:
             z[key] = _Skipped(meta["shape"])
             continue
         w = codec.dequant_key(manifest, buf, key)

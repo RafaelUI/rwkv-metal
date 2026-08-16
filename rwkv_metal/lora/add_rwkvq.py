@@ -37,17 +37,18 @@ def _backend_for(sidecar_path: str, key: str, native):
     одна; у нынешнего пресета REDUCTION квантованные группы лежат в sym, а
     LoRA-ветки -- в asym, и предположение перестало быть верным.
     """
-    from .rwkvq_linear import RwkvqSymLinear, load_sidecar
+    from .rwkvq_linear import (QUANTIZED_KINDS, RwkvqSymLinear,
+                               load_sidecar)
     _, manifest = load_sidecar(sidecar_path)
     kind = manifest["tensors"][key].get("kind", "sb6")
     if kind == "sym":
         # Родного quantized_matmul для блока 16 не существует, см.
         # докстринг RwkvqSymLinear. Выбора тут нет, и это не умолчание.
         return RwkvqSymLinear
-    if kind != "sb6":
+    if kind not in QUANTIZED_KINDS:
         raise ValueError(
             f"{key}: раскладка {kind!r} QLoRA-базой не поддержана "
-            f"(знаем sb6 и sym)")
+            f"(знаем {', '.join(QUANTIZED_KINDS)})")
     if native == "hybrid":
         return RwkvqHybridLinear
     return RwkvqNativeLinear if native else RwkvqLinear
