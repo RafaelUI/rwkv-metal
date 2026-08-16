@@ -29,6 +29,60 @@ import mlx.core as mx
 _TMIX_KEY = {"r_proj": "receptance", "k_proj": "key", "v_proj": "value", "o_proj": "output"}
 
 
+def _backend_for(sidecar_path: str, key: str, native):
+    """Класс бэкенда ПО РАСКЛАДКЕ КЛЮЧА, а не один на всю модель.
+
+    Прежде бэкенд выбирался один раз на весь вызов, и это молча
+    предполагало, что файл однороден. Файл им и был, пока раскладка была
+    одна; у нынешнего пресета REDUCTION квантованные группы лежат в sym, а
+    LoRA-ветки -- в asym, и предположение перестало быть верным.
+    """
+    from .rwkvq_linear import RwkvqSymLinear, load_sidecar
+    _, manifest = load_sidecar(sidecar_path)
+    kind = manifest["tensors"][key].get("kind", "sb6")
+    if kind == "sym":
+        # Родного quantized_matmul для блока 16 не существует, см.
+        # докстринг RwkvqSymLinear. Выбора тут нет, и это не умолчание.
+        return RwkvqSymLinear
+    if kind != "sb6":
+        raise ValueError(
+            f"{key}: раскладка {kind!r} QLoRA-базой не поддержана "
+            f"(знаем sb6 и sym)")
+    if native == "hybrid":
+        return RwkvqHybridLinear
+    return RwkvqNativeLinear if native else RwkvqLinear
+
+
+def _check_quantized_coverage(sidecar_path: str, expected_keys) -> None:
+    """Каждый ключ, который конфиг СОБИРАЕТСЯ заменить, обязан лежать в
+    файле в известной раскладке. Проверяется ДО первой замены.
+
+    Без этой проверки несовпадение вылезало как KeyError на первом же
+    ключе: `_load_rwkvq_direct` пропускает всё, чего не умеет, а падает
+    уже потребитель -- с именем тензора и без диагноза. На файле нынешнего
+    пресета это читалось бы как «нет такого тензора» при том, что тензор
+    есть, а не поддержана его раскладка. Разница между «нет» и «не умеем»
+    стоит одного прохода по манифесту.
+    """
+    from rwkv_quant.formats import codec
+
+    from .rwkvq_linear import load_sidecar
+    _, loaded = load_sidecar(sidecar_path)
+    missing = sorted(k for k in expected_keys if k not in loaded["tensors"])
+    if not missing:
+        return
+    full, _ = codec.open_rwkvq(os.path.expanduser(sidecar_path))
+    counts = {}
+    for k in missing:
+        kind = full["tensors"].get(k, {}).get("kind", "НЕТ В ФАЙЛЕ")
+        counts[kind] = counts.get(kind, 0) + 1
+    raise ValueError(
+        f"QLoRA-база: {len(missing)} из {len(expected_keys)} ключей не "
+        f"загрузились квантованными. По раскладкам: "
+        + ", ".join(f"{k} -- {v}" for k, v in sorted(counts.items()))
+        + f". Первый: {missing[0]}.")
+
+
 def _replace_targets_with_rwkvq(model, sidecar_path: str, rank: int, alpha: float,
                                  dropout: float, tmix_targets, quantize_cmix: bool,
                                  quantize_head: bool, layers, native: bool = True) -> list:
@@ -47,12 +101,13 @@ def _replace_targets_with_rwkvq(model, sidecar_path: str, rank: int, alpha: floa
     sb6 scale/bias, развёрнутые на лету (см. rwkvq_hybrid.py) -- память
     как у fused-кернеля, но на маленьких тензорах МЕДЛЕННЕЕ native из-за
     launch-overhead разворачивания (см. tests/dev_check_hybrid.py)."""
-    if native == "hybrid":
-        Backend = RwkvqHybridLinear
-    else:
-        Backend = RwkvqNativeLinear if native else RwkvqLinear
-    _from_sidecar = Backend.from_sidecar
     n_layer = len(model.blocks)
+    _check_quantized_coverage(sidecar_path, _skip_keys_for(
+        n_layer, tmix_targets, quantize_cmix, quantize_head, layers)[0])
+
+    def _from_sidecar(key_path, key):
+        return _backend_for(key_path, key, native).from_sidecar(key_path, key)
+
     sel = set(range(n_layer)) if layers is None else set(i % n_layer for i in layers)
     wrapped = []
 

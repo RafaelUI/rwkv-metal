@@ -64,13 +64,37 @@ def _load_rwkvq_direct(path: str):
     from rwkv_quant.formats import codec
 
     manifest, buf = codec.open_rwkvq(path)
-    arrays, tensors = {}, {}
+    arrays, tensors, syms = {}, {}, {}
     for key, meta in manifest["tensors"].items():
-        if meta["kind"] != "sb6":
+        kind = meta.get("kind")
+        if kind not in ("sb6", "sym"):
             continue
 
         def b(field):
             return buf.get(f"{key}::{field}")
+
+        if kind == "sym":
+            # Q6_K-раскладка нынешнего пресета REDUCTION. Интерлив НЕ
+            # собирается здесь заново: берётся SymQuantLinear из
+            # rwkv-quant (закон 23 -- параллельные реализации расходятся
+            # ровно тогда, когда правку вносят в одну из них). Он
+            # torch-free, поэтому импорт сюда законен.
+            from rwkv_quant.backends.metal.quant_linear_sym import (
+                SymQuantLinear)
+            try:
+                syms[key] = SymQuantLinear.from_buffers(
+                    shape=tuple(meta["shape"]), bits=meta["bits"],
+                    qs=b("gw_qs"), d=b("gw_d"), codes=b("codes"),
+                    codes_packed=b("codes_packed"),
+                    qh=b("gw_qh"), qh2=b("gw_qh2"))
+            except AssertionError:
+                # Кернель требует IN кратным суперблоку 256. Пропускаем
+                # МОЛЧА сознательно: если этот ключ и правда нужен,
+                # ругнётся проверка покрытия в add_rwkvq -- и назовёт
+                # причину, а не просто имя тензора.
+                continue
+            tensors[key] = dict(meta)
+            continue
 
         qblk, qsqm, ddm, xbits = codec.sb6_to_k3(
             b("codes_packed"), b("gw_qsqm"), b("gw_d"), b("gw_dm"),
@@ -84,6 +108,10 @@ def _load_rwkvq_direct(path: str):
         # потребители не различали источник.
         tensors[key] = dict(meta, xbits=xbits)
     mx.eval(*arrays.values())
+    # Объекты кладутся ПОСЛЕ mx.eval: их буферы уже отевалуированы внутри
+    # from_buffers, а сами они не mx.array и в eval попасть не должны.
+    for key, lin in syms.items():
+        arrays[f"{key}::sym"] = lin
     return arrays, dict(manifest, tensors=tensors)
 
 
@@ -177,3 +205,58 @@ class RwkvqLinear(nn.Module):
     def __call__(self, x):
         w = self._dequant_w()
         return x @ w.T
+
+
+class RwkvqSymLinear(nn.Module):
+    """Frozen linear поверх sym-квантованного тензора (Q6_K-раскладка).
+
+    ПОЧЕМУ НЕ ЧЕРЕЗ РОДНОЙ quantized_matmul, как sb6. У sym блок ШЕСТНАДЦАТЬ,
+    а `mx.quantized_matmul` принимает group_size только 32, 64 и 128 --
+    это проверено перебором, а не выведено
+    (rwkv-quant/tests/probe_prefill_affine.py). Точного репака не
+    существует, а неточный означал бы ДРУГУЮ квантованную базу под тем же
+    именем -- ровно тот сорт подмены, от которого в проекте есть отдельный
+    закон. Поэтому здесь путь RwkvqLinear: деквант в плотную на каждый
+    forward, база в памяти живёт сжатой.
+
+    ЦЕНА ЭТОГО ВЫБОРА РЕАЛЬНА И ЕЁ НАДО МЕРИТЬ, А НЕ СЧИТАТЬ: sb6-база на
+    родном матмуле плотную матрицу не материализует вовсе, а эта --
+    материализует на каждый вызов, и автограду она нужна ещё и в backward
+    (градиент по x есть dY @ W). Закрывается это своим VJP с ПЕРЕСЧЁТОМ
+    декванта вместо хранения; здесь этого нет сознательно -- сначала
+    паритет с sb6-путём, потом отдельная правка с отдельным замером.
+
+    Интерлив и кернель НЕ ДУБЛИРУЮТСЯ: берётся SymQuantLinear из
+    rwkv-quant. Деквант считается в fp32, где он бит-в-бит совпадает с
+    нормативным `codec.dequant_sym` (гейт
+    rwkv-quant/tests/test_sym_dequant_fp32.py), и приводится к bf16 ровно
+    там же, где это делает sb6-путь -- чтобы две базы отличались
+    раскладкой, а не точностью математики.
+    """
+
+    def __init__(self, sym):
+        super().__init__()
+        # Имя с подчёркиванием -- НЕ параметр модуля: буферы базы заморожены
+        # и в parameters() им делать нечего (иначе оптимизатор увидел бы
+        # квантованную базу как обучаемое).
+        self._sym = sym
+        self.out_features = sym.out_features
+        self.in_features = sym.in_features
+        self.bits = sym.bits
+        self.freeze()
+
+    @classmethod
+    def from_sidecar(cls, sidecar_path: str, key: str):
+        arrays, _ = load_sidecar(sidecar_path)
+        lin = arrays.get(f"{key}::sym")
+        if lin is None:
+            raise KeyError(
+                f"{key}: sym-буферов нет. Либо тензор в файле не sym, либо "
+                f"его IN не кратен суперблоку 256 и кернель его не берёт.")
+        return cls(lin)
+
+    def _dequant_w(self) -> mx.array:
+        return self._sym._dequant_w(mx.float32).astype(mx.bfloat16)
+
+    def __call__(self, x):
+        return x @ self._dequant_w().T
