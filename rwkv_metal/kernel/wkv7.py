@@ -341,9 +341,21 @@ constant uint CHUNK_C     = {T};
 constant uint H_C         = {H};
 """
     body = r"""
-    uint dv   = thread_position_in_grid.y;
-    uint bhi  = thread_position_in_grid.x;
+    // dv -- индекс потока ВНУТРИ threadgroup: запуск идёт threadgroup=(1, D),
+    // одна группа на пару (b, h), ради стейджинга ниже.
+    uint dv   = thread_position_in_threadgroup.y;
+    uint bhi  = threadgroup_position_in_grid.x;
     uint bi   = bhi / H_C; uint hi = bhi % H_C;
+
+    // a/w/k/b/r на шаге t одинаковы для всех 64 потоков группы, и без
+    // стейджинга каждое значение читалось из глобальной памяти 64 раза
+    // (2048 потоков x T x 5 строк x 256 байт = 1.34 ГБ на вызов при 29 МБ
+    // полезного трафика). Ровно тот же приём и та же причина, что уже
+    // стояли в forward-ядре обучения, -- сюда они не доехали. Порядок
+    // суммирования НЕ меняется, выход бит-в-бит прежний
+    // (tests/test_wkv_infer_parity.py в rwkv-quant).
+    threadgroup float a_sh[HEAD_SIZE_C], w_sh[HEAD_SIZE_C], k_sh[HEAD_SIZE_C];
+    threadgroup float b_sh[HEAD_SIZE_C], r_sh[HEAD_SIZE_C];
 
     float h_row[HEAD_SIZE_C];
     uint h_base = (bi*H_C+hi)*HEAD_SIZE_C*HEAD_SIZE_C + dv*HEAD_SIZE_C;
@@ -351,14 +363,21 @@ constant uint H_C         = {H};
 
     for (uint t=0; t<CHUNK_C; t++) {
         uint base = ((bi*CHUNK_C+t)*H_C+hi)*HEAD_SIZE_C;
+        a_sh[dv]=a[base+dv]; w_sh[dv]=w[base+dv]; k_sh[dv]=k[base+dv];
+        b_sh[dv]=b[base+dv]; r_sh[dv]=r[base+dv];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         float sa = 0.0f;
-        for (uint dk=0; dk<HEAD_SIZE_C; dk++) sa += h_row[dk]*a[base+dk];
+        for (uint dk=0; dk<HEAD_SIZE_C; dk++) sa += h_row[dk]*a_sh[dk];
         float v_dv = v[base+dv];
         for (uint dk=0; dk<HEAD_SIZE_C; dk++)
-            h_row[dk] = w[base+dk]*h_row[dk] + v_dv*k[base+dk] + sa*b[base+dk];
+            h_row[dk] = w_sh[dk]*h_row[dk] + v_dv*k_sh[dk] + sa*b_sh[dk];
         float y = 0.0f;
-        for (uint dk=0; dk<HEAD_SIZE_C; dk++) y += h_row[dk]*r[base+dk];
-        out[((bi*CHUNK_C+t)*H_C+hi)*HEAD_SIZE_C+dv] = y;
+        for (uint dk=0; dk<HEAD_SIZE_C; dk++) y += h_row[dk]*r_sh[dk];
+        out[base+dv] = y;
+
+        // Следующий шаг перезапишет *_sh, пока кто-то ещё читает текущие.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint dk=0; dk<HEAD_SIZE_C; dk++) h_out[h_base+dk] = h_row[dk];
 """
@@ -378,7 +397,7 @@ def wkv7_infer(r, w, k, v, a, b, h):
     inputs = [x.astype(mx.float32) for x in [r,w,k,v,a,b,h]]
     res = _get_infer_kernel(H, T)(
         inputs=inputs,
-        grid=(B*H, D, 1), threadgroup=(1, 1, 1),
+        grid=(B*H, D, 1), threadgroup=(1, D, 1),
         output_shapes=[(B,T,H,D), (B,H,D,D)],
         output_dtypes=[mx.float32, mx.float32],
     )
