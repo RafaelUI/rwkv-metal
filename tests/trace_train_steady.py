@@ -49,12 +49,26 @@ def swap_mb():
 
 def main():
     from rwkv_metal.lora import load_rwkvq_model
+    import rwkv_metal.model.rwkv7_x070 as _mod
+
+    # ABLATE=wkv -- та же нагрузка с ЗАГЛУШЁННОЙ рекуррентностью.
+    # Нужна для проверки гипотезы о дырах в счётчиках: если дыры -- это
+    # WKV (2048 потоков независимо от T, счётчикам нечего сэмплировать),
+    # они обязаны исчезнуть, а F32-лимитер просесть. Если останутся --
+    # виновата диспетчеризация, и лечится она оп-каунтом.
+    if os.environ.get("ABLATE") == "wkv":
+        def _stub(r, w, k, v, a, b, training=True, state=None,
+                  return_state=False):
+            return r * 0.5 + v * 0.5 + (k + w + a + b) * 0.0, None
+        _mod.wkv7 = _stub
 
     model, cfg, info = load_rwkvq_model(PATH, rank=RANK, verbose=False)
     model._grad_ckpt = True          # ставится ЯВНО: умолчание модели -- False
     print(f"pid {os.getpid()} | {os.path.basename(PATH)} | T={T} rank={RANK} "
           f"| адаптеров {info['num_lora_adapters']} "
-          f"| grad_checkpoint={model._grad_ckpt}", flush=True)
+          f"| grad_checkpoint={model._grad_ckpt}"
+          f"{' | WKV ЗАГЛУШЁН' if os.environ.get('ABLATE') == 'wkv' else ''}",
+          flush=True)
 
     rs = np.random.RandomState(5)
     x = mx.array(rs.randint(1, 60000, size=(1, T)).astype(np.int32))
