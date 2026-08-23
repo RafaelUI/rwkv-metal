@@ -15,6 +15,8 @@ Forward и backward — по ОДНОМУ GPU-вызову на весь T.
 
 Результат: 1.73× ускорение vs v2 chunked (T=512, медиана 40 итераций)
 """
+import os
+
 import mlx.core as mx
 
 HEAD_SIZE = 64
@@ -247,6 +249,185 @@ constant uint TS_C        = {TILE_BWD};
     return kern
 
 
+# ── backward v2: порт схемы кернеля Бо Пэна (RWKV-CUDA/rwkv7_fast_fused) ────
+# ЧТО МЕНЯЕТСЯ. Прежний backward держит СТРОКУ состояния (как forward) и
+# потому вынужден считать dr/dw/dk/da/db МЕЖПОТОКОВЫМИ редукциями: пять
+# TILED_REDUCE на каждый шаг времени, каждая -- запись в threadgroup-тайл
+# и два барьера. Замер (bench_wkv_fwd_vs_bwd, B=1, T=512, H=32): backward
+# 13.74 мс на слой против forward 2.03, то есть 6.8x при отношении по
+# флопсам около 3x -- обвязка редукций стоит примерно столько же, сколько
+# сама математика. По B backward масштабируется линейно (11.4-13.7 мс на
+# последовательность на B=1..8), значит дело не в занятости.
+#
+# ИДЕЯ ПОРТА -- ТРАНСПОНИРОВАННОЕ СОСТОЯНИЕ. Поток держит не строку, а
+# КОЛОНКУ: stT[j] = h[j][i]. Тогда dr[i] = sum_j h[j][i]*dy[j] и все
+# остальные пять величин становятся скалярными произведениями ВНУТРИ
+# потока с shared-векторами. Межпотоковая редукция остаётся ровно одна --
+# dSb (нужна для da), один обмен через threadgroup вместо пяти.
+# Цена -- регистры: три массива по 64 float (stT, dst, dstT) против двух.
+#
+# ЧТО НЕ ПЕРЕНОСИТСЯ ИЗ CUDA-ИСХОДНИКА. Кернель Бо принимает СЫРОЙ w и
+# считает exp/сигмоиду внутри, отдавая dw уже по цепочке правила. У нас w
+# приходит готовым множителем затухания, и dw_out -- производная по нему;
+# формулу активации сюда тянуть НЕЛЬЗЯ, иначе градиент будет посчитан
+# дважды. Проверяется гейтом паритета с v1.
+#
+# CHUNK ОСТАЁТСЯ 16 И ВВЕРХ НЕ ИДЁТ. Реконструкция hp = (h - k*v - b*sa)/w
+# умножает ошибку на 1/w за шаг; w на обученной 1.5B не опускается ниже
+# exp(-0.606531) = 0.545 (probe_w_distribution), то есть не более 1.83 за
+# шаг и до ~1.2e4 за 16 шагов -- на fp32 это ~1e-3 относительной ошибки.
+# При 32 накопление уходит за пределы типа; рекомендация автора (<=16)
+# совпадает с этим счётом.
+_bwd2_cache: dict = {}
+
+# Рантайм-переключатель для A/B В ОДНОМ ПРОЦЕССЕ (закон 27): версия файла
+# сравнивала бы две программы, а не две редакции правки. Читается на
+# каждый вызов vjp.
+# УМОЛЧАНИЕ ВКЛЮЧЕНО 24.08 решением владельца: v2 быстрее на 3.7% сквозного
+# шага при ТОЙ ЖЕ памяти, а расхождение с v1 лежит на измеренном шумовом полу
+# переассоциации (2.06e-3 против пола 1.99e-3, bench_wkv_bwd_v2_step_ab).
+# WKV_BWD_V2=0 или ck.BWD_V2 = False возвращает прежнее ядро ДИНАМИЧЕСКИ --
+# флаг читается на каждый вызов vjp, поэтому A/B живёт в одном процессе.
+BWD_V2 = os.environ.get("WKV_BWD_V2", "1") != "0"
+
+
+def _dot4(dst, expr_a, expr_b, n=HEAD_SIZE):
+    """Скалярное произведение с четырьмя независимыми аккумуляторами.
+
+    Кернель латентностно-связан на цепочках зависимых FMA (замер в шапке
+    файла: ~0.08 ТФЛОП/с при полосе 5 ГБ/с), поэтому цепочку рвём. То же
+    решение и та же причина, что у ACC_FWD/ACC_BWD в v1."""
+    lines = [f"    float {dst}0=0.0f,{dst}1=0.0f,{dst}2=0.0f,{dst}3=0.0f;",
+             f"    for (uint j=0; j<{n}; j+=4) {{"]
+    for u in range(4):
+        lines.append(f"        {dst}{u} += {expr_a.format(j=f'j+{u}')}"
+                     f" * {expr_b.format(j=f'j+{u}')};")
+    lines.append("    }")
+    lines.append(f"    float {dst} = ({dst}0+{dst}1)+({dst}2+{dst}3);")
+    return "\n".join(lines)
+
+
+def _get_ckpt_bwd_v2(H: int, T: int):
+    key = (H, T)
+    if key in _bwd2_cache: return _bwd2_cache[key]
+    N = T // CHUNK
+    hdr = f"""
+constant uint HEAD_SIZE_C = {HEAD_SIZE};
+constant uint T_C         = {T};
+constant uint CHUNK_C     = {CHUNK};
+constant uint N_CHUNKS_C  = {N};
+constant uint H_C         = {H};
+"""
+    src = r"""
+    uint i    = thread_position_in_threadgroup.x;
+    uint bhi  = threadgroup_position_in_grid.x;
+    uint bidx = bhi / H_C, hi = bhi % H_C;
+
+    threadgroup float r_sh[HEAD_SIZE_C], w_sh[HEAD_SIZE_C], k_sh[HEAD_SIZE_C];
+    threadgroup float v_sh[HEAD_SIZE_C], a_sh[HEAD_SIZE_C], b_sh[HEAD_SIZE_C];
+    threadgroup float dy_sh[HEAD_SIZE_C], sa_sh[HEAD_SIZE_C];
+    threadgroup float dsb_sh[HEAD_SIZE_C];
+
+    // stT[j] = h[j][i] -- КОЛОНКА состояния (в forward поток держит строку).
+    // dst -- строка i градиента по состоянию, dstT -- его же колонка: обе
+    // нужны, потому что dv/dSb берутся по строке, а dw/dk/db -- по колонке.
+    float stT[HEAD_SIZE_C], dst[HEAD_SIZE_C], dstT[HEAD_SIZE_C];
+
+    uint hbase = (bidx*H_C+hi)*HEAD_SIZE_C*HEAD_SIZE_C;
+    uint hrow  = hbase + i*HEAD_SIZE_C;
+    for (uint j=0; j<HEAD_SIZE_C; j++) {
+        dst[j]  = d_h_out[hrow + j];
+        dstT[j] = d_h_out[hbase + j*HEAD_SIZE_C + i];
+    }
+
+    for (int c=(int)N_CHUNKS_C-1; c>=0; c--) {
+        // Точный чекпоинт чанка, колонкой i. Соседние потоки читают
+        // соседние адреса (шаг по j -- внешний), то есть чтение
+        // коалесцировано, несмотря на "транспонированность".
+        uint ckb = ((bidx*H_C+hi)*N_CHUNKS_C+(uint)c)*HEAD_SIZE_C*HEAD_SIZE_C;
+        for (uint j=0; j<HEAD_SIZE_C; j++)
+            stT[j] = h_ckpts[ckb + j*HEAD_SIZE_C + i];
+
+        for (int t=(int)CHUNK_C-1; t>=0; t--) {
+            uint base = ((bidx*T_C+(uint)c*CHUNK_C+(uint)t)*H_C+hi)*HEAD_SIZE_C;
+
+            r_sh[i]=r[base+i]; w_sh[i]=w[base+i]; k_sh[i]=k[base+i];
+            v_sh[i]=v[base+i]; a_sh[i]=a[base+i]; b_sh[i]=b[base+i];
+            dy_sh[i]=d_out[base+i]; sa_sh[i]=sa_fwd[base+i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float ri=r_sh[i], wi=w_sh[i], ki=k_sh[i];
+            float ai=a_sh[i], bb=b_sh[i], dyi=dy_sh[i];
+
+            // dr[i] = sum_j h[j][i]*dy[j] -- состояние ДО реконструкции
+__DR__
+            dr_out[base+i] = dr;
+
+            // Обратная реконструкция: h_prev[j][i] =
+            //   (h[j][i] - v[j]*k[i] - sa[j]*b[i]) / w[i]
+            float iwi = 1.0f/wi;
+            for (uint j=0; j<HEAD_SIZE_C; j++) {
+                stT[j]   = (stT[j] - v_sh[j]*ki - sa_sh[j]*bb) * iwi;
+                dst[j]  += dyi*r_sh[j];
+                dstT[j] += ri*dy_sh[j];
+            }
+
+            // ПЯТЬ СКАЛЯРНЫХ ПРОИЗВЕДЕНИЙ ОДНИМ ПРОХОДОМ. Порознь они
+            // читали три регистровых массива (stT/dst/dstT) по пять раз;
+            // при динамической индексации это верный путь в спилл. Здесь
+            // каждый элемент читается один раз, и пять цепочек FMA идут
+            // независимо -- ILP вместо развёртки по ACC.
+            float dw0=0.0f,dw1=0.0f, dkv0=0.0f,dkv1=0.0f, dvv0=0.0f,dvv1=0.0f;
+            float db0=0.0f,db1=0.0f, dsb0=0.0f,dsb1=0.0f;
+            for (uint j=0; j<HEAD_SIZE_C; j+=2) {
+                float tA=dstT[j],   tB=dstT[j+1];
+                float sA=stT[j],    sB=stT[j+1];
+                float uA=dst[j],    uB=dst[j+1];
+                dw0  += tA*sA;         dw1  += tB*sB;
+                dkv0 += tA*v_sh[j];    dkv1 += tB*v_sh[j+1];
+                db0  += tA*sa_sh[j];   db1  += tB*sa_sh[j+1];
+                dvv0 += uA*k_sh[j];    dvv1 += uB*k_sh[j+1];
+                dsb0 += uA*b_sh[j];    dsb1 += uB*b_sh[j+1];
+            }
+            float dw=dw0+dw1, dkv=dkv0+dkv1, dvv=dvv0+dvv1;
+            float db=db0+db1, dsb=dsb0+dsb1;
+            dw_out[base+i] = dw;
+            dk_out[base+i] = dkv;
+            dv_out[base+i] = dvv;
+            db_out[base+i] = db;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            dsb_sh[i] = dsb;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ЕДИНСТВЕННАЯ межпотоковая величина: da[i] = sum_j h_prev[j][i]*dSb[j]
+__DA__
+            da_out[base+i] = da;
+
+            for (uint j=0; j<HEAD_SIZE_C; j++) {
+                dst[j]  = dst[j]*w_sh[j] + dsb*a_sh[j];
+                dstT[j] = dstT[j]*wi + ai*dsb_sh[j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    for (uint j=0; j<HEAD_SIZE_C; j++) dh_in_out[hrow + j] = dst[j];
+"""
+    for tag, (dst_, ea, eb) in {
+        "__DR__":  ("dr",  "stT[{j}]",  "dy_sh[{j}]"),
+        "__DA__":  ("da",  "stT[{j}]",  "dsb_sh[{j}]"),
+    }.items():
+        src = src.replace(tag, _dot4(dst_, ea, eb))
+
+    kern = mx.fast.metal_kernel(
+        name=f"wkv7_ckpt_bwd2_H{H}_T{T}",
+        input_names=["r","w","k","v","a","b","h_ckpts","sa_fwd","d_out","d_h_out"],
+        output_names=["dr_out","dw_out","dk_out","dv_out","da_out","db_out","dh_in_out"],
+        header=hdr, source=src, atomic_outputs=False,
+    )
+    _bwd2_cache[key] = kern
+    return kern
+
+
 def make_wkv7_checkpoint_with_state(B: int, T: int, H: int, D: int = HEAD_SIZE):
     """
     Create a stateful checkpoint-kernel function.
@@ -275,7 +456,8 @@ def make_wkv7_checkpoint_with_state(B: int, T: int, H: int, D: int = HEAD_SIZE):
         _, _, sa_fwd, h_ckpts = outputs
         # mx.eval убран — Metal kernel принимает lazy tensors,
         # mx.compile запрещает eval внутри трансформаций
-        res = _get_ckpt_bwd(H, T)(
+        _bwd = _get_ckpt_bwd_v2(H, T) if BWD_V2 else _get_ckpt_bwd(H, T)
+        res = _bwd(
             inputs=[x.astype(mx.float32) for x in [r, w, k, v, a, b, h_ckpts, sa_fwd, d_out, d_h_out]],
             grid=(B*H*D, 1, 1), threadgroup=(D, 1, 1),
             output_shapes=[(B,T,H,D)]*6 + [(B,H,D,D)],
