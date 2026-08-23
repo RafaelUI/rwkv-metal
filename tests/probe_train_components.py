@@ -50,7 +50,12 @@ def main():
 
     def wkv_stub(r, w, k, v, a, b, training=True, state=None,
                  return_state=False):
-        out = r * 0.5 + v * 0.5 + (k + w + a + b) * 0.0
+        # ЗАКОН 34: ядро отдаёт fp32, и заглушка обязана тоже -- иначе
+        # разность включает перевод хвоста блока в bf16 и приписывается
+        # WKV. С учётом каста в слое (22.08) разность «полный − заглушка»
+        # всё равно содержит цену fp32-ХВОСТА (ln_x/bonus/gate в fp32),
+        # который снимает только CAST_WKV_OUTPUT: читай её как «WKV+хвост».
+        out = (r * 0.5 + v * 0.5).astype(mx.float32)
         return out, None
 
     def dq_stub(self):

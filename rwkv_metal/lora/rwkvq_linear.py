@@ -54,6 +54,84 @@ from .rwkvq_kernel import dequant_dense
 # том, что логиты оставались верными до бита. Поэтому список ровно один.
 QUANTIZED_KINDS = ("sb6", "sym")
 
+# КАСТ ВХОДА В КВАНТОВАННОМ ЛИНЕЙНОМ СЛОЕ (внедрено 22.08, решение
+# владельца). Прежний `x @ w.T` без приведения позволял fp32-выходу ядра
+# WKV тащить за собой fp32-копию деквантованной матрицы и fp32-матмул на
+# каждом слое -- 12-27% тренировочного шага (bench_wkv_fp32_tail_ab).
+# Правка делает ровно то, что инференсный путь rwkv-quant
+# (`quant_model._matmul`) делает с самого начала. Гейты: ppl на обоих
+# масштабах нейтрален (+0.0044%/+0.0024%, не значимо), KL-сдвиг от bf16
+# +3% против +23% у CAST_WKV_OUTPUT (probe_cast_kl). Гейт правки --
+# tests/test_lincast_parity.py. RWKVQ_NOCAST=1 (или rl.NOCAST = True)
+# возвращает прежнее поведение для A/B В ОДНОМ ПРОЦЕССЕ (закон 27);
+# флаг читается на каждый вызов.
+NOCAST = os.environ.get("RWKVQ_NOCAST") == "1"
+
+# FUSED dequant+GEMM для sym (23.08, приоритет 1). Заменяет пару
+# «деквант-кернель bf16 + плотный матмул» ОДНИМ кернелем: без плотного
+# транзиента и с половиной запусков. Градиент -- через mx.custom_function
+# (mx.fast-кернель непрозрачен для автограда, без VJP адаптеры ниже слоя
+# молча получили бы НУЛЕВЫЕ градиенты -- ловушка хуже падения).
+#
+# ИЗМЕРЕНО (bench_fused_gemm_ab, чередование, своп-контроль): лосс и
+# градиенты БИТ-В-БИТ прежнему пути, пик шага 3272 -> 2976 МБ (-296),
+# но СКОРОСТЬ 2728 -> 2818 мс (-3.3%, валидный прогон; второй прогон
+# -5.2% при росте свопа -- самопомечен невалидным). Оценка «~200 мс/шаг»
+# из NEXT_SESSION НЕ подтвердилась: fused-GEMM идёт на 1.9-2.5 ТФ против
+# 2.3-2.8 у плотного матмула, и это съедает всю экономию декванта.
+# Поэтому УМОЛЧАНИЕ ВЫКЛ (opt-in RWKVQ_FUSED=1), включение -- решение
+# владельца: -300 МБ пика против -3..5% шага. Рантайм-реверс для A/B в
+# одном процессе: rl.NOFUSED = True/False (закон 27). FUSED_CALLS --
+# счётчик включения для гейтов/бенчей: «правка не применилась» обязана
+# быть видимой, а не читаться как «правка чиста».
+FUSED_ENABLED = os.environ.get("RWKVQ_FUSED") == "1"
+NOFUSED = not FUSED_ENABLED
+FUSED_CALLS = 0
+
+
+def _matmul_cast(self, x):
+    if NOCAST:
+        return x @ self._dequant_w().T
+    w = self._dequant_w()
+    return (x.astype(w.dtype) @ w.T).astype(x.dtype)
+
+
+def _sym_fused_call(self, x):
+    """__call__ RwkvqSymLinear с fused-путем для T >= 64.
+
+    Семантика -- ПОБИТНО прежней строки `(x.astype(bf16) @ W.T).astype(x.dtype)`
+    в части точности: кернель округляет веса до bf16 тем же текстом, что
+    деквант-кернель, копит во float, выход -- bf16; меняется только ПОРЯДОК
+    суммирования (гейт пороговый, relmax ~ 3e-3)."""
+    global FUSED_CALLS
+    lead = x.shape[:-1]
+    x2d = x.reshape(-1, self.in_features)
+    T = x2d.shape[0]
+    sym = self._sym
+    if (not NOFUSED) and T >= sym.GEMM_FUSED_MIN_T and sym.gemm_fused_ok:
+        if self._fused_fn is None:
+            self._fused_fn = _build_sym_fused_fn(sym)
+        xb = x2d if x2d.dtype == mx.bfloat16 else x2d.astype(mx.bfloat16)
+        out = self._fused_fn(xb).reshape(*lead, self.out_features)
+        FUSED_CALLS += 1
+        return out if x.dtype == mx.bfloat16 else out.astype(x.dtype)
+    return _matmul_cast(self, x)
+
+
+def _build_sym_fused_fn(sym):
+    @mx.custom_function
+    def _f(xb):
+        return sym.gemm_fused(xb)
+
+    @_f.vjp
+    def _f_vjp(primals, cotangent, output):
+        # VJP прежнего пути: dX = dY.astype(bf16) @ W (порядок суммирования
+        # другой, семантика та же); котангенты только по x -- буферы базы
+        # константы и градиента не требуют
+        return (sym.gemm_fused_vjp(cotangent.astype(mx.bfloat16)),)
+
+    return _f
+
 _SIDECAR_CACHE = {}
 
 
@@ -212,8 +290,7 @@ class RwkvqLinear(nn.Module):
         return w.reshape(OUT, IN).astype(mx.bfloat16)
 
     def __call__(self, x):
-        w = self._dequant_w()
-        return x @ w.T
+        return _matmul_cast(self, x)
 
 
 class RwkvqSymLinear(nn.Module):
@@ -252,6 +329,7 @@ class RwkvqSymLinear(nn.Module):
         self.out_features = sym.out_features
         self.in_features = sym.in_features
         self.bits = sym.bits
+        self._fused_fn = None
         self.freeze()
 
     @classmethod
@@ -265,7 +343,12 @@ class RwkvqSymLinear(nn.Module):
         return cls(lin)
 
     def _dequant_w(self) -> mx.array:
-        return self._sym._dequant_w(mx.float32).astype(mx.bfloat16)
+        # Прямой bf16-выход кернеля (23.08): прежде было
+        # `_dequant_w(mx.float32).astype(mx.bfloat16)`, и astype-перекладка
+        # стоила 30% цепочки декванта (68.6 мс на проход по модели, два
+        # прохода на шаг с чекпоинтингом). Бит-в-бит с прежней цепочкой --
+        # гейт tests/test_sym_dequant_bf16.py на всех 146 sym-тензорах.
+        return self._sym._dequant_w(mx.bfloat16)
 
     def __call__(self, x):
-        return x @ self._dequant_w().T
+        return _sym_fused_call(self, x)
