@@ -219,8 +219,7 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
         if meta["kind"] in QUANTIZED_KINDS and key in skip_set:
             z[key] = _Skipped(meta["shape"])
             continue
-        w = codec.dequant_key(manifest, buf, key)
-        z[key] = mx.array(w).astype(mx.bfloat16)
+        z[key] = _dequant_to_bf16(manifest, buf, key)
         n_deq += 1
     if verbose:
         print(f"деквантовано {n_deq} тензоров, sb6 оставлено заглушками "
@@ -445,3 +444,32 @@ def save_converted(pth_path, out_path):
     mx.save_safetensors(out_path, dict(tree_flatten(m.parameters())))
     print("saved ->", out_path)
     return True
+
+
+def _dequant_to_bf16(manifest, buf, key):
+    """Деквант ключа сразу в bf16, ПОЛОСАМИ СТРОК.
+
+    Прежде здесь стояло `mx.array(codec.dequant_key(...)).astype(bfloat16)`,
+    и на emb 2.9B [65536, 2560] это держало разом три полноразмерные копии:
+    fp32 в numpy (640 МБ), её копию в mx (640) и результат (320). emb
+    квантованным модулем не подменяется никогда, поэтому цена платилась
+    КАЖДУЮ загрузку.
+
+    Каст поэлементный, поэтому полоса даёт ПОБИТОВО тот же результат, что
+    каст целого (гейт rwkv-quant/tests/test_dequant_band_parity.py сторожит
+    равенство самого декванта, а каст поверх него от нарезки не зависит).
+    mx.eval на каждой полосе обязателен: без него граф ленив и все fp32-
+    полосы доживают до конца, то есть правка не делает ничего.
+    """
+    from rwkv_quant.formats import codec
+    parts = []
+    for _a, _b, band in codec.dequant_key_bands(manifest, buf, key):
+        p = mx.array(band).astype(mx.bfloat16)
+        mx.eval(p)
+        parts.append(p)
+        del band
+    if len(parts) == 1:
+        return parts[0]
+    out = mx.concatenate(parts, axis=0)
+    mx.eval(out)
+    return out
