@@ -103,9 +103,21 @@ def load_pth(path):
     return {k: v.materialize() for k, v in lazy.items()}
 
 
-def convert(z, n_layer, H, S):
-    """официальные имена x070 -> наши (rwkv7_x070). bf16 сохраняется."""
-    T = lambda a: a.T  # транспонирование low-rank
+def convert(z, n_layer, H, S, transposed=None):
+    """официальные имена x070 -> наши (rwkv7_x070). bf16 сохраняется.
+
+    ОРИЕНТАЦИЯ low-rank -- ДАННЫЕ, А НЕ ТАБЛИЦА ИМЁН (закон 23). Сырой
+    world-чекпоинт хранит w/a/v/g{1,2} как [in,out], и им нужен .T. Файл
+    .rwkvq с 28.08 квантует LoRA вдоль оси РЕДУКЦИИ, то есть хранит уже
+    [out,in], и второй .T там ломает форму (ловилось сверкой состава
+    весов: (2048,96) против (96,2048) на всех восьми ключах слоя).
+    `transposed` -- карта {ключ: надо ли транспонировать} из
+    codec.is_transposed; None = всё сырое, то есть прежнее поведение и
+    единственный вариант для пути .pth.
+    """
+    def T(key):
+        a = z[key]
+        return a.T if (transposed is None or transposed.get(key, True)) else a
     out = {
         'emb.weight': z['emb.weight'],
         'ln0.weight': z['blocks.0.ln0.weight'], 'ln0.bias': z['blocks.0.ln0.bias'],
@@ -125,13 +137,13 @@ def convert(z, n_layer, H, S):
         out[P + 'k_proj.weight'] = z[att + 'key.weight']
         out[P + 'v_proj.weight'] = z[att + 'value.weight']
         out[P + 'o_proj.weight'] = z[att + 'output.weight']
-        out[P + 'w_lora_A.weight'] = T(z[att + 'w1']); out[P + 'w_lora_B.weight'] = T(z[att + 'w2'])
+        out[P + 'w_lora_A.weight'] = T(att + 'w1'); out[P + 'w_lora_B.weight'] = T(att + 'w2')
         out[P + 'w_lora_B.bias'] = z[att + 'w0'].reshape(-1)
-        out[P + 'a_lora_A.weight'] = T(z[att + 'a1']); out[P + 'a_lora_B.weight'] = T(z[att + 'a2'])
+        out[P + 'a_lora_A.weight'] = T(att + 'a1'); out[P + 'a_lora_B.weight'] = T(att + 'a2')
         out[P + 'a_lora_B.bias'] = z[att + 'a0'].reshape(-1)
-        out[P + 'g_lora_A.weight'] = T(z[att + 'g1']); out[P + 'g_lora_B.weight'] = T(z[att + 'g2'])
+        out[P + 'g_lora_A.weight'] = T(att + 'g1'); out[P + 'g_lora_B.weight'] = T(att + 'g2')
         if i > 0:
-            out[P + 'v_lora_A.weight'] = T(z[att + 'v1']); out[P + 'v_lora_B.weight'] = T(z[att + 'v2'])
+            out[P + 'v_lora_A.weight'] = T(att + 'v1'); out[P + 'v_lora_B.weight'] = T(att + 'v2')
             out[P + 'v_lora_B.bias'] = z[att + 'v0'].reshape(-1)
         out[P + 'ln_x.weight'] = z[att + 'ln_x.weight']; out[P + 'ln_x.bias'] = z[att + 'ln_x.bias']
         out[b + 'cmix.x_k'] = z[ffn + 'x_k']
@@ -225,7 +237,11 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
         print(f"деквантовано {n_deq} тензоров, sb6 оставлено заглушками "
               f"{len(z) - n_deq}")
 
-    conv_lazy = convert(z, n_layer, H, S)
+    # Ориентация LoRA берётся из манифеста файла, а не из таблицы
+    # имён: с 28.08 она стала свойством ТЕНЗОРА (см. convert).
+    orient = {k: codec.is_transposed(manifest, k)
+              for k in manifest["tensors"]}
+    conv_lazy = convert(z, n_layer, H, S, transposed=orient)
 
     model_keys = set(k for k, _ in tree_flatten(m.parameters()))
     conv_keys = set(conv_lazy.keys())

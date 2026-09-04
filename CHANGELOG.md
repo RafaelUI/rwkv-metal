@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.2
+
+### Fixed
+
+- **LoRA orientation on the `.rwkvq` path** (`rwkv_metal/model/convert.py`).
+  `convert()` transposed all eight low-rank matrices of a layer
+  unconditionally. That is correct for a raw world checkpoint, which stores
+  `w/a/v/g{1,2}` as `[in, out]`, but wrong for a `.rwkvq` written after
+  2026-08-28: those quantize LoRA along the reduction axis and store
+  `[out, in]` already, recording the fact per tensor in the manifest. Loading
+  such a file aborted on the weight-composition check --
+  `w_lora_A (2048, 96) against (96, 2048)` -- on every LoRA key of every layer.
+
+  Orientation is now passed into `convert()` as data: `transposed={key: bool}`,
+  built from `codec.is_transposed()`. The default `None` means "all raw", which
+  is the previous behaviour and the only option for the `.pth` path.
+
+  Verified on 1.5B as a 2x2 (both layouts x before/after the fix): the old
+  layout stays green and unchanged (798 parameters, 459 identical, 323 within
+  quantization error, none outside), the new layout goes from aborting to those
+  same numbers. Decode, perplexity and a 40-step QLoRA run were re-measured on
+  both layouts, one instrument each, and show no regression.
+
 ## 0.3.1
 
 A dtype leak in the residual stream, found while porting to Swift and measured
