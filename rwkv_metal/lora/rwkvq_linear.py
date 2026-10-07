@@ -43,6 +43,7 @@ import os
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from .rwkvq_kernel import dequant_dense
 
 # ЕДИНЫЙ СПИСОК КВАНТОВАННЫХ РАСКЛАДОК. Их перечисляют ТРИ места: этот
@@ -179,6 +180,43 @@ def _build_sym_fused_fn(sym):
 
 _SIDECAR_CACHE = {}
 
+# КРУПНЫЕ ТРАНЗИЕНТЫ ХОСТА -- ПОЛОСАМИ СТРОК (07.10). Освобождённую крупную область malloc macOS
+# системе не отдаёт: она остаётся в footprint процесса как «Malloc Large (empty)». Перекладка
+# целого тензора на хосте (K3-интерлив, родная упаковка MLX с int32-кодами) оставляла после
+# загрузки 1.5B COMPRESSION 1.4 ГБ такой памяти. Полоса ограничивает транзиент, склейка идёт
+# уже в памяти MLX; результат побитно тот же (гейт tests/test_load_memory.py). То же лечение,
+# что в Metal-бэкенде rwkv-quant 05.10 (quant_linear_gw._mx_rows).
+HOST_BAND_MB = 16
+
+
+def _band_rows(row_bytes: int) -> int:
+    return max(1, int(HOST_BAND_MB * 2 ** 20) // max(1, int(row_bytes)))
+
+
+def _mx_bands(make, OUT: int, rows: int):
+    """make(a, b) -> кортеж numpy-массивов для строк [a, b); -> кортеж mx.array, склеенных по строкам."""
+    parts = []
+    for a in range(0, OUT, rows):
+        p = tuple(mx.array(np.ascontiguousarray(z)) for z in make(a, min(a + rows, OUT)))
+        mx.eval(*p)
+        parts.append(p)
+    if len(parts) == 1:
+        return parts[0]
+    out = tuple(mx.concatenate([p[i] for p in parts], axis=0) for i in range(len(parts[0])))
+    mx.eval(*out)
+    del parts
+    return out
+
+
+def drop_sidecar_cache(path=None):
+    """Забыть разобранный файл (все -- при path=None). Кеш нужен, пока модули строятся по ключу;
+    после сборки модели он держит буферы, которые родному бэкенду уже не нужны (K3-раскладка при
+    native=True -- около размера файла лишней памяти MLX). Модули, владеющие буферами, не задеты."""
+    if path is None:
+        _SIDECAR_CACHE.clear()
+    else:
+        _SIDECAR_CACHE.pop(path, None)
+
 
 def _load_rwkvq_direct(path: str):
     """`.rwkvq` -> те же (arrays, manifest), что даёт сайдкар.
@@ -228,13 +266,25 @@ def _load_rwkvq_direct(path: str):
             tensors[key] = dict(meta)
             continue
 
-        qblk, qsqm, ddm, xbits = codec.sb6_to_k3(
-            b("codes_packed"), b("gw_qsqm"), b("gw_d"), b("gw_dm"),
-            shape=tuple(meta["shape"]), gs=meta["gw_gs"], sb=meta["gw_sb"],
-            nb=meta.get("n_blocks"), qh=b("gw_qh"), qh2=b("gw_qh2"))
-        arrays[f"{key}::qblk"] = mx.array(qblk)
-        arrays[f"{key}::qsqm"] = mx.array(qsqm)
-        arrays[f"{key}::ddm"] = mx.array(ddm)
+        OUT, IN = meta["shape"]
+        src = [b(f) for f in ("codes_packed", "gw_qsqm", "gw_d", "gw_dm", "gw_qh", "gw_qh2")]
+        assert all(v is None or v.shape[0] == OUT for v in src), f"{key}: буферы не построчные"
+        xb = [None]
+
+        def k3(a, e, src=src, meta=meta, IN=IN, xb=xb):
+            cp, sq, d, dm, qh, qh2 = (None if v is None else v[a:e] for v in src)
+            qblk, qsqm, ddm, xb[0] = codec.sb6_to_k3(
+                cp, sq, d, dm, shape=(e - a, IN), gs=meta["gw_gs"], sb=meta["gw_sb"],
+                nb=meta.get("n_blocks"), qh=qh, qh2=qh2)
+            return qblk, qsqm, ddm
+
+        # вход полосы и её K3-выход -- примерно по размеру строки каждый
+        rows = _band_rows(2 * sum(v[:1].nbytes for v in src if v is not None))
+        qblk, qsqm, ddm = _mx_bands(k3, OUT, rows)
+        xbits = xb[0]
+        arrays[f"{key}::qblk"] = qblk
+        arrays[f"{key}::qsqm"] = qsqm
+        arrays[f"{key}::ddm"] = ddm
         # xbits в манифесте .rwkvq нет: там он выводится из наличия
         # битплоскостей, а сайдкар хранил его явно. Проставляем, чтобы
         # потребители не различали источник.

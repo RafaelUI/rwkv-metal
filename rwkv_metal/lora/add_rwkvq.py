@@ -58,6 +58,15 @@ def _backend_for(sidecar_path: str, key: str, native):
     return RwkvqNativeLinear if native else RwkvqLinear
 
 
+def _finish_load(sidecar_path: str) -> None:
+    """Конец сборки модели (07.10): забыть разобранный файл и отдать кеш MLX. Кеш загрузчика
+    после сборки держит буферы, которые родному бэкенду уже не нужны (K3-раскладка при
+    native=True -- около размера файла); кеш MLX после загрузки -- транзиенты перекладки."""
+    from .rwkvq_linear import drop_sidecar_cache
+    drop_sidecar_cache(sidecar_path)
+    mx.clear_cache()
+
+
 def _file_kind(sidecar_path: str, key: str):
     """Раскладка ключа по ПОЛНОМУ манифесту .rwkvq (load_sidecar оставляет только квантованные).
     None -- ключа нет либо путь -- прежний сайдкар, а не .rwkvq."""
@@ -171,6 +180,7 @@ def add_lora_rwkvq(model, sidecar_path: str, rank: int = 16, alpha: float = 32.0
     model.freeze()
     _unfreeze_adapters(model)
     mx.eval(model.parameters())
+    _finish_load(sidecar_path)
 
     info = _param_stats(model)
     info["wrapped_per_block"] = sorted(set(wrapped))
@@ -248,6 +258,7 @@ def load_rwkvq_model(rwkvq_path, rank: int = 16, alpha: float = 32.0,
     model.freeze()
     _unfreeze_adapters(model)
     mx.eval(model.parameters())
+    _finish_load(rwkvq_path)
 
     info = _param_stats(model)
     info["wrapped_per_block"] = sorted(set(wrapped_holder))
@@ -290,6 +301,7 @@ def load_lora_rwkvq_model(pth_path, sidecar_path, rank: int = 16, alpha: float =
     model.freeze()
     _unfreeze_adapters(model)
     mx.eval(model.parameters())
+    _finish_load(sidecar_path)
 
     info = _param_stats(model)
     info["wrapped_per_block"] = sorted(set(wrapped_holder))

@@ -40,17 +40,21 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import rwkvq_linear as _rl
 from .rwkvq_linear import RwkvqLinear
 
 GROUP_SIZE = 32
 BITS = 6
 
 
-def _codes_scale_bias(lin: RwkvqLinear):
+def _codes_scale_bias(lin: RwkvqLinear, a: int = 0, e: int = None):
     """Как RwkvqLinear._dequant_w_slow, но без финального combine --
-    отдельно коды (0..63 int), scale[OUT,NB] f32, bias[OUT,NB] f32."""
-    OUT, IN, NB, NSB = lin.out_features, lin.in_features, lin.NB, lin.NSB
-    blk = lin.qblk.reshape(OUT, NB, 16 + 4 * lin.xbits)
+    отдельно коды (0..63 int), scale[OUT,NB] f32, bias[OUT,NB] f32.
+    a, e -- полоса строк [a, e) (07.10): коды на хосте лежат в int32, по 4 байта на вес,
+    и целый тензор оставлял сотни мегабайт «Malloc Large (empty)» (см. rwkvq_linear.HOST_BAND_MB)."""
+    e = lin.out_features if e is None else e
+    OUT, IN, NB, NSB = e - a, lin.in_features, lin.NB, lin.NSB
+    blk = lin.qblk[a:e].reshape(OUT, NB, 16 + 4 * lin.xbits)
     cb = blk[:, :, :16]
     q = mx.concatenate([cb & 0xF, cb >> 4], axis=2).astype(mx.int32)
     if lin.xbits >= 1:
@@ -62,10 +66,10 @@ def _codes_scale_bias(lin: RwkvqLinear):
         bits2 = (qh2[..., None] >> mx.arange(8, dtype=mx.uint8)) & 1
         q = q + bits2.reshape(OUT, NB, 32).astype(mx.int32) * 32
 
-    sm = lin.qsqm.reshape(OUT, NB, 2)
+    sm = lin.qsqm[a:e].reshape(OUT, NB, 2)
     qs = sm[:, :, 0].astype(mx.float32)
     qm = mx.view(sm[:, :, 1], mx.int8).astype(mx.float32)
-    dd = lin.ddm.reshape(OUT, NSB, 2)
+    dd = lin.ddm[a:e].reshape(OUT, NSB, 2)
     d = dd[:, :, 0].astype(mx.float32)
     dm = dd[:, :, 1].astype(mx.float32)
     sb = NB // NSB
@@ -104,12 +108,15 @@ class RwkvqNativeLinear(nn.Module):
         super().__init__()
         self.out_features, self.in_features = lin.out_features, lin.in_features
         self.bits = 4 + lin.xbits
-        codes, scale, bias = _codes_scale_bias(lin)
-        OUT, NB, _ = codes.shape
-        wq_np = _pack_codes_mlx(codes, self.bits).reshape(OUT, NB * self.bits)
-        self.wq = mx.array(wq_np)
-        self.scale = mx.array(scale)
-        self.bias = mx.array(bias)
+        bits, NB = self.bits, lin.NB
+
+        def band(a, e):
+            codes, scale, bias = _codes_scale_bias(lin, a, e)
+            return _pack_codes_mlx(codes, bits).reshape(e - a, NB * bits), scale, bias
+
+        # на хосте: int32-коды (4 байта на вес) + упакованные слова и scale / bias
+        rows = _rl._band_rows(6 * self.in_features)
+        self.wq, self.scale, self.bias = _rl._mx_bands(band, self.out_features, rows)
         self.freeze()
 
     @classmethod
