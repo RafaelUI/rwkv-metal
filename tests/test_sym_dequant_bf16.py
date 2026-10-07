@@ -35,7 +35,9 @@ assert bits_seen == [6, 8], "в файле ожидались ОБЕ битно�
 bad = 0
 for k in keys:
     lin = RwkvqSymLinear.from_sidecar(PATH, k)
-    new = lin._dequant_w()                              # прямая bf16
+    # 07.10: умолчание базы -- fp16; bf16-ветка кернеля теперь служит ОБРАТНОМУ проходу
+    # (rl.BWD_DTYPE) и прежнему режиму rl.BASE_DTYPE = bf16 -- проверяется она же, явным типом
+    new = lin._dequant_w_as(mx.bfloat16)                # прямая bf16
     old = lin._sym._dequant_w(mx.float32).astype(mx.bfloat16)
     mx.eval(new, old)
     if new.dtype != mx.bfloat16:

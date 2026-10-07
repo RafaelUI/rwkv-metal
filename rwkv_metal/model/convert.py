@@ -228,7 +228,9 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
         # плотный bf16 целиком (145 тензоров, ~6 ГБ транзиентов) ради
         # того, чтобы хук тут же заменил её квантованными модулями.
         # По логитам это не видно вовсе -- только по пику памяти.
-        if meta["kind"] in QUANTIZED_KINDS and key in skip_set:
+        # Плотная цель (нынешние пресеты: o_proj слоя 0) тоже заглушка: её
+        # читает RwkvqDenseLinear, а деквант здесь был бы выброшенным транзиентом.
+        if (meta["kind"] in QUANTIZED_KINDS or meta["kind"] == "dense") and key in skip_set:
             z[key] = _Skipped(meta["shape"])
             continue
         z[key] = _dequant_to_bf16(manifest, buf, key)

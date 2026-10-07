@@ -30,6 +30,10 @@ from mlx.utils import tree_flatten         # noqa: E402
 from rwkv_metal.lora.rwkvq_linear import RwkvqSymLinear  # noqa: E402
 from rwkv_metal.lora import rwkvq_linear as rl            # noqa: E402
 
+# 07.10: fused-кернель считает и округляет в bf16 по построению и применяется только при
+# базе bf16 (умолчание базы с 07.10 -- fp16). Гейт сторожит именно bf16-путь -- тип закреплён.
+rl.BASE_DTYPE, rl.BWD_DTYPE = mx.bfloat16, None
+
 PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/reduction_new.rwkvq"
 KEYS = [
     ("blocks.0.att.receptance.weight", 3e-3, 6e-3),   # [2048,2048]@8

@@ -67,6 +67,27 @@ QUANTIZED_KINDS = ("sb6", "sym")
 # флаг читается на каждый вызов.
 NOCAST = os.environ.get("RWKVQ_NOCAST") == "1"
 
+# ТИП КВАНТОВАННОЙ БАЗЫ: чем округляется деквант и в чём считается матмул слоя.
+# УМОЛЧАНИЕ С 07.10 -- fp16 (решение владельца; норма rwkv-quant с 02.10, codec.py): у bf16 7 бит
+# мантиссы против 10 у fp16 при тех же двух байтах. Прежде было bf16.
+# Замер (tests/_sess/probe_base_dtype_0710.py; KL к исходной модели, REDUCTION, files_0110):
+#   0.1B: bf16 0.005238 -> fp16 0.004958 (-5.4% [-7.3; -3.5]); 1.5B g1j: 0.002528 -> 0.002280
+#   (-9.8% [-13.0; -7.4]); fp16 в пределах +0.6...+0.8% от плеча без каста входа (fp32-матмул).
+# Читается на каждый вызов: rl.BASE_DTYPE = mx.bfloat16 возвращает прежнее поведение -- A/B в
+# одном процессе (закон 27). RWKVQ_BASE_DTYPE=bf16|fp16. Гейт: tests/test_base_dtype.py.
+_BASE_DTYPES = {"bf16": mx.bfloat16, "fp16": mx.float16}
+BASE_DTYPE = _BASE_DTYPES[os.environ.get("RWKVQ_BASE_DTYPE", "fp16")]
+# ТИП ОБРАТНОГО ПРОХОДА через слой при базе fp16. УМОЛЧАНИЕ -- bf16: прямой проход в fp16,
+# обратный своим VJP в bf16 (dX = dY @ W, W деквантуется в bf16). Почему не fp16 насквозь:
+# у fp16 узкая экспонента (минимум нормального 6e-5), мелкие котангенты теряют разряды.
+# Замер градиентов адаптеров, отн. L2 к плечу без каста (0.1B / 1.5B, T=256):
+#   bf16 насквозь (как было) 2.2e-2 / 2.5e-2;   fp16 насквозь 5.1e-2 / 1.5e-1 (косинус 0.988!);
+#   fp16 + обратный bf16     1.3e-2 / 1.4e-2;   fp16 + обратный fp32 1.0e-2 / 9.8e-3.
+# Цена на шаге обучения 1.5B, T=512 (чередование): обратный bf16 +1.5% времени и +56 МБ пика,
+# обратный fp32 +3.5% и +360 МБ; fp16 насквозь +0.1%. None ("same") -- автоград в типе базы.
+_BWD_DTYPES = {"same": None, "bf16": mx.bfloat16, "fp32": mx.float32}
+BWD_DTYPE = _BWD_DTYPES[os.environ.get("RWKVQ_BWD_DTYPE", "bf16")]
+
 # FUSED dequant+GEMM для sym (23.08, приоритет 1). Заменяет пару
 # «деквант-кернель bf16 + плотный матмул» ОДНИМ кернелем: без плотного
 # транзиента и с половиной запусков. Градиент -- через mx.custom_function
@@ -92,8 +113,31 @@ FUSED_CALLS = 0
 def _matmul_cast(self, x):
     if NOCAST:
         return x @ self._dequant_w().T
+    if BASE_DTYPE == mx.float16 and BWD_DTYPE is not None:
+        fn = getattr(self, "_wide_bwd_fn", None)
+        if fn is None:
+            fn = self._wide_bwd_fn = _build_wide_bwd_fn(self)
+        return fn(x)
     w = self._dequant_w()
     return (x.astype(w.dtype) @ w.T).astype(x.dtype)
+
+
+def _build_wide_bwd_fn(mod):
+    """Прямой проход в типе базы (fp16), обратный -- в BWD_DTYPE. Буферы базы -- константы,
+    котангент только по x. Флаги читаются на каждый вызов."""
+    @mx.custom_function
+    def _f(x):
+        w = mod._dequant_w()
+        return (x.astype(w.dtype) @ w.T).astype(x.dtype)
+
+    @_f.vjp
+    def _f_vjp(primals, cotangent, output):
+        x = primals[0] if isinstance(primals, (list, tuple)) else primals
+        ct = cotangent[0] if isinstance(cotangent, (list, tuple)) else cotangent
+        w = mod._dequant_w_as(BWD_DTYPE)
+        return ((ct.astype(BWD_DTYPE) @ w).astype(x.dtype),)
+
+    return _f
 
 
 def _sym_fused_call(self, x):
@@ -108,7 +152,8 @@ def _sym_fused_call(self, x):
     x2d = x.reshape(-1, self.in_features)
     T = x2d.shape[0]
     sym = self._sym
-    if (not NOFUSED) and T >= sym.GEMM_FUSED_MIN_T and sym.gemm_fused_ok:
+    # fused-кернель считает и округляет в bf16 по построению: при базе fp16 он не применяется
+    if (not NOFUSED) and BASE_DTYPE == mx.bfloat16 and T >= sym.GEMM_FUSED_MIN_T and sym.gemm_fused_ok:
         if self._fused_fn is None:
             self._fused_fn = _build_sym_fused_fn(sym)
         xb = x2d if x2d.dtype == mx.bfloat16 else x2d.astype(mx.bfloat16)
@@ -246,11 +291,14 @@ class RwkvqLinear(nn.Module):
             tuple(meta["shape"]), meta["gw_gs"], meta["gw_sb"], meta["xbits"],
         )
 
-    def _dequant_w(self) -> mx.array:
+    def _dequant_w_as(self, dtype) -> mx.array:
         w32 = dequant_dense(self.qblk, self.qsqm, self.ddm,
                              self.out_features, self.in_features,
                              gw_sb=self._gw_sb, xbits=self.xbits)
-        return w32.astype(mx.bfloat16)
+        return w32.astype(dtype)
+
+    def _dequant_w(self) -> mx.array:
+        return self._dequant_w_as(BASE_DTYPE)
 
     def _dequant_w_slow(self) -> mx.array:
         """Медленный чисто-MLX путь (~8 отдельных операций) -- держим для
@@ -288,6 +336,47 @@ class RwkvqLinear(nn.Module):
 
         w = q * scale.reshape(OUT, NB, 1) + mn.reshape(OUT, NB, 1)
         return w.reshape(OUT, IN).astype(mx.bfloat16)
+
+    def __call__(self, x):
+        return _matmul_cast(self, x)
+
+
+class RwkvqDenseLinear(nn.Module):
+    """Frozen linear поверх тензора, который лежит в .rwkvq ПЛОТНЫМ (kind "dense").
+
+    Зачем (07.10). С 20.09 оба пресета rwkv-quant держат o_proj слоя 0 в bf16 (bits_overrides -> 16):
+    цель QLoRA в файле не квантована. Загрузчик требовал, чтобы ВСЕ цели были квантованными, и не
+    открывал ни один нынешний файл пресета. Плотная цель -- намерение файла, а не ошибка: она
+    оборачивается этим модулем, и LoRA встаёт поверх него так же, как поверх квантованной базы.
+
+    Вес -- исходный bf16 как есть (у kind "dense" квантования нет, округлять нечего). Хранится не
+    параметром (имя с подчёркиванием), как буферы квантованных баз: база заморожена.
+    """
+
+    def __init__(self, w):
+        super().__init__()
+        self._w = w
+        self.out_features, self.in_features = w.shape
+        self.freeze()
+
+    @classmethod
+    def from_sidecar(cls, sidecar_path: str, key: str):
+        from rwkv_quant.formats import codec
+        manifest, buf = codec.open_rwkvq(os.path.expanduser(sidecar_path))
+        meta = manifest["tensors"].get(key)
+        if meta is None or meta.get("kind") != "dense":
+            raise KeyError(f"{key}: в файле нет плотного тензора с таким ключом")
+        w = mx.array(codec.dequant_key(manifest, buf, key)).astype(mx.bfloat16)
+        if codec.is_transposed(manifest, key):
+            w = w.T
+        mx.eval(w)
+        return cls(w)
+
+    def _dequant_w_as(self, dtype) -> mx.array:
+        return self._w if dtype == self._w.dtype else self._w.astype(dtype)
+
+    def _dequant_w(self) -> mx.array:
+        return self._dequant_w_as(BASE_DTYPE)
 
     def __call__(self, x):
         return _matmul_cast(self, x)
@@ -348,7 +437,10 @@ class RwkvqSymLinear(nn.Module):
         # стоила 30% цепочки декванта (68.6 мс на проход по модели, два
         # прохода на шаг с чекпоинтингом). Бит-в-бит с прежней цепочкой --
         # гейт tests/test_sym_dequant_bf16.py на всех 146 sym-тензорах.
-        return self._sym._dequant_w(mx.bfloat16)
+        return self._dequant_w_as(BASE_DTYPE)
+
+    def _dequant_w_as(self, dtype) -> mx.array:
+        return self._sym._dequant_w(dtype)
 
     def __call__(self, x):
         return _sym_fused_call(self, x)

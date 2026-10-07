@@ -234,6 +234,22 @@ model, cfg, info = rk.lora.load_rwkvq_model(
 )
 ```
 
+Targets that the file stores dense are fine: both `rwkv-quant` presets keep the
+layer-0 output projection in bf16, and the loader wraps such a tensor in a plain
+frozen dense base with the adapter on top (`tests/test_rwkvq_dense_target.py`).
+
+**Precision of the frozen base.** Dequantised weights are rounded to fp16 and the
+base matmul runs in fp16 (the `rwkv-quant` norm; bf16 has 7 mantissa bits, fp16
+has 10, at the same two bytes). The backward pass through the base runs in bf16
+through a custom VJP, because fp16 end to end loses small cotangents. Measured on
+the `reduction` preset, KL to the original checkpoint: −5.4% at 0.1B and −9.8% at
+1.5B against the previous bf16 base; adapter gradients are closer to the uncast
+reference (relative L2 1.4e-2 vs 2.5e-2 at 1.5B). Cost on a 1.5B training step at
+T=512: +1.4% time, +56 MB peak. `RWKVQ_BASE_DTYPE=bf16` (or
+`rwkvq_linear.BASE_DTYPE = mx.bfloat16`) restores the previous behaviour;
+`RWKVQ_BWD_DTYPE=fp32|bf16|same` selects the backward type. Gate:
+`tests/test_base_dtype.py`.
+
 The `.pth` used to be required alongside the quantized file, for the tensors a
 sidecar never carried: normalisations, token-shift multipliers, the low-rank
 lora branches, embeddings. On 2.9B that is 5.9 GB fetched and read to obtain

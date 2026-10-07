@@ -33,6 +33,7 @@ from rwkv_quant.formats import codec  # noqa: E402
 from rwkv_metal.lora.add_rwkvq import (  # noqa: E402
     _backend_for, _check_quantized_coverage)
 from rwkv_metal.lora.rwkvq_linear import RwkvqSymLinear  # noqa: E402
+from rwkv_metal.lora import rwkvq_linear as rl  # noqa: E402
 from rwkv_metal.lora.rwkvq_native import RwkvqNativeLinear  # noqa: E402
 
 SYM = sys.argv[1] if len(sys.argv) > 1 else "/tmp/reduction_new.rwkvq"
@@ -84,16 +85,23 @@ print(f"диспетчер: {'ОК' if bad == 0 else 'КРАСНЫЙ'}")
 manifest, buf = codec.open_rwkvq(os.path.expanduser(SYM))
 rs = np.random.RandomState(3)
 print(f"\n{'ключ':<38}{'бит':>5}{'max|dW|':>11}{'max|dY|':>11}")
-for k in sym_keys:
+# 07.10: тип базы -- переключатель rl.BASE_DTYPE (умолчание fp16, прежде bf16). Равенство
+# с нормативной читалкой требуется в ОБОИХ типах: и нынешнее умолчание, и прежний режим.
+assert rl.BASE_DTYPE == mx.float16, "умолчание базы ожидалось fp16"
+for k, base in [(k, b) for k in sym_keys for b in (mx.float16, mx.bfloat16)]:
+    rl.BASE_DTYPE = base
     lin = RwkvqSymLinear.from_sidecar(SYM, k)
-    ref_w = mx.array(codec.dequant_key(manifest, buf, k)).astype(mx.bfloat16)
+    ref_w = mx.array(codec.dequant_key(manifest, buf, k)).astype(base)
     got_w = lin._dequant_w()
+    assert got_w.dtype == base, (k, got_w.dtype)
     dw = float(mx.abs(got_w.astype(mx.float32)
                       - ref_w.astype(mx.float32)).max())
     x = mx.array(rs.randn(2, lin.in_features).astype(np.float32)
                  ).astype(mx.bfloat16)
-    dy = float(mx.abs((lin(x) - x @ ref_w.T).astype(mx.float32)).max())
+    dy = float(mx.abs((lin(x) - (x.astype(base) @ ref_w.T).astype(x.dtype)
+                       ).astype(mx.float32)).max())
     bad += (dw != 0.0) or (dy != 0.0)
+    rl.BASE_DTYPE = mx.float16
     print(f"{k:<38}{manifest['tensors'][k]['bits']:>5}{dw:>11.3e}{dy:>11.3e}")
     del lin, ref_w, got_w
     mx.clear_cache()

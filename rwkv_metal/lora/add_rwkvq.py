@@ -37,9 +37,13 @@ def _backend_for(sidecar_path: str, key: str, native):
     одна; у нынешнего пресета REDUCTION квантованные группы лежат в sym, а
     LoRA-ветки -- в asym, и предположение перестало быть верным.
     """
-    from .rwkvq_linear import (QUANTIZED_KINDS, RwkvqSymLinear,
-                               load_sidecar)
+    from .rwkvq_linear import (QUANTIZED_KINDS, RwkvqDenseLinear,
+                               RwkvqSymLinear, load_sidecar)
     _, manifest = load_sidecar(sidecar_path)
+    if key not in manifest["tensors"] and _file_kind(sidecar_path, key) == "dense":
+        # Цель лежит в файле плотной (нынешние пресеты: o_proj слоя 0) --
+        # это намерение файла, см. докстринг RwkvqDenseLinear.
+        return RwkvqDenseLinear
     kind = manifest["tensors"][key].get("kind", "sb6")
     if kind == "sym":
         # Родного quantized_matmul для блока 16 не существует, см.
@@ -52,6 +56,20 @@ def _backend_for(sidecar_path: str, key: str, native):
     if native == "hybrid":
         return RwkvqHybridLinear
     return RwkvqNativeLinear if native else RwkvqLinear
+
+
+def _file_kind(sidecar_path: str, key: str):
+    """Раскладка ключа по ПОЛНОМУ манифесту .rwkvq (load_sidecar оставляет только квантованные).
+    None -- ключа нет либо путь -- прежний сайдкар, а не .rwkvq."""
+    from rwkv_quant.formats import codec
+    p = os.path.expanduser(sidecar_path)
+    if not os.path.isfile(p):
+        return None
+    try:
+        full, _ = codec.open_rwkvq(p)
+    except Exception:                                    # noqa: BLE001 -- не .rwkvq
+        return None
+    return full["tensors"].get(key, {}).get("kind")
 
 
 def _check_quantized_coverage(sidecar_path: str, expected_keys) -> None:
@@ -70,6 +88,9 @@ def _check_quantized_coverage(sidecar_path: str, expected_keys) -> None:
     from .rwkvq_linear import load_sidecar
     _, loaded = load_sidecar(sidecar_path)
     missing = sorted(k for k in expected_keys if k not in loaded["tensors"])
+    # Плотная цель -- не «не умеем», а «файл так решил» (07.10): её берёт
+    # RwkvqDenseLinear. rtn / asym / отсутствие ключа -- по-прежнему отказ.
+    missing = [k for k in missing if _file_kind(sidecar_path, k) != "dense"]
     if not missing:
         return
     full, _ = codec.open_rwkvq(os.path.expanduser(sidecar_path))
