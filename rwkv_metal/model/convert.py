@@ -103,6 +103,24 @@ def load_pth(path):
     return {k: v.materialize() for k, v in lazy.items()}
 
 
+def _ranks_from_shapes(shape_of, n_layer, D):
+    """Ранги low-rank веток (w / a / v / g) -- ПО ФОРМАМ тензоров чекпоинта, формула лишь запасной вариант.
+
+    Формула lora_ranks(D) расходится с выпущенными чекпоинтами: у rwkv7-g1d-0.4b (D=1024) ветка g имеет
+    ранг 128, а формула даёт 160 -- и ни .pth, ни .rwkvq этой модели не открывались («конверсия не
+    чистая», найдено 07.10). У 0.1B / 1.5B / 2.9B формула совпадает с файлом. shape_of(официальный
+    ключ) -> форма либо None; ранг -- меньшая сторона первой найденной blocks.N.att.{w,a,v,g}1."""
+    from .rwkv7_x070 import lora_ranks
+    ranks = dict(lora_ranks(D))
+    for kind in ("w", "a", "v", "g"):
+        for i in range(n_layer):
+            sh = shape_of(f"blocks.{i}.att.{kind}1")
+            if sh is not None:
+                ranks[kind] = int(min(sh))
+                break
+    return ranks
+
+
 def convert(z, n_layer, H, S, transposed=None):
     """официальные имена x070 -> наши (rwkv7_x070). bf16 сохраняется.
 
@@ -205,7 +223,8 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
             train_data="", val_data="", max_steps=1,
         )
 
-    m = RWKV7X070(config)
+    m = RWKV7X070(config, ranks=_ranks_from_shapes(
+        lambda k: manifest["tensors"].get(k, {}).get("shape"), n_layer, D))
 
     # z: официальные (world) имена -> значения.
     #
@@ -316,7 +335,8 @@ def load_pretrained(pth_path, config=None, verbose=True):
             train_data="", val_data="", max_steps=1,
         )
 
-    m = RWKV7X070(config)
+    m = RWKV7X070(config, ranks=_ranks_from_shapes(
+        lambda k: z[k].shape if k in z else None, n_layer, D))
     conv = convert(z, n_layer, H, S)
 
     model_keys = set(k for k, _ in tree_flatten(m.parameters()))
@@ -378,7 +398,8 @@ def load_pretrained_partial(pth_path, skip_official_keys, config=None, verbose=T
             train_data="", val_data="", max_steps=1,
         )
 
-    m = RWKV7X070(config)
+    m = RWKV7X070(config, ranks=_ranks_from_shapes(
+        lambda k: z_lazy[k].shape if k in z_lazy else None, n_layer, D))
     conv_lazy = convert(z_lazy, n_layer, H, S)  # дешёвый rename, БЕЗ чтения байт
 
     # Валидация ключей -- ДО хука: хук меняет структуру дерева параметров
