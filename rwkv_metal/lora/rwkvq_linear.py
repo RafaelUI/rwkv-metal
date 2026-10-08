@@ -312,6 +312,14 @@ def load_sidecar(path: str):
         arrays = mx.load(path + ".safetensors")
         with open(path + ".json") as f:
             manifest = json.load(f)
+        # sym-тензоры сайдкара (08.10): интерлив export_mlx лежит готовым, объект
+        # собирается из него тем же классом rwkv-quant, что и при чтении .rwkvq
+        from rwkv_quant.backends.metal.quant_linear_sym import SymQuantLinear
+        for key, meta in manifest["tensors"].items():
+            if meta.get("kind") == "sym" and f"{key}::qblk" in arrays:
+                arrays[f"{key}::sym"] = SymQuantLinear.from_interleaved(
+                    shape=tuple(meta["shape"]), bits=meta["bits"], qblk=arrays[f"{key}::qblk"],
+                    qs=arrays[f"{key}::qs"], d=arrays[f"{key}::d"])
     _SIDECAR_CACHE[path] = (arrays, manifest)
     return arrays, manifest
 
@@ -412,7 +420,19 @@ class RwkvqDenseLinear(nn.Module):
     @classmethod
     def from_sidecar(cls, sidecar_path: str, key: str):
         from rwkv_quant.formats import codec
-        manifest, buf = codec.open_rwkvq(os.path.expanduser(sidecar_path))
+        p = os.path.expanduser(sidecar_path)
+        if not os.path.isfile(p) and os.path.exists(p + ".json"):
+            # прежний сайдкар export_mlx (08.10): bf16 лежит как есть под ::dense
+            with open(p + ".json") as f:
+                meta = json.load(f)["tensors"].get(key)
+            if meta is None or meta.get("kind") != "dense":
+                raise KeyError(f"{key}: в сайдкаре нет плотного тензора с таким ключом")
+            w = mx.load(p + ".safetensors")[f"{key}::dense"].astype(mx.bfloat16)
+            if meta.get("transposed"):
+                w = w.T
+            mx.eval(w)
+            return cls(w)
+        manifest, buf = codec.open_rwkvq(p)
         meta = manifest["tensors"].get(key)
         if meta is None or meta.get("kind") != "dense":
             raise KeyError(f"{key}: в файле нет плотного тензора с таким ключом")

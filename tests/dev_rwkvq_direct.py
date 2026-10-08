@@ -41,7 +41,7 @@ def main():
     a_side, m_side = load_sidecar(sidecar)
     a_direct, m_direct = load_sidecar(rwkvq)
     print(f"сайдкар: {len(m_side['tensors'])} тензоров, "
-          f".rwkvq напрямую: {len(m_direct['tensors'])} sb6")
+          f".rwkvq напрямую: {len(m_direct['tensors'])} квантованных")
 
     common = sorted(set(m_side["tensors"]) & set(m_direct["tensors"]))
     check("состав пересекается", bool(common), f"{len(common)} общих")
@@ -56,9 +56,12 @@ def main():
             picked.append(k)
 
     n_el = 0
+    from rwkv_metal.lora.rwkvq_linear import RwkvqSymLinear
     for key in picked:
-        ws = RwkvqLinear.from_sidecar(sidecar, key)._dequant_w()
-        wd = RwkvqLinear.from_sidecar(rwkvq, key)._dequant_w()
+        # класс -- по раскладке ключа (08.10): у REDUCTION проекции в sym, а не sb6
+        cls = RwkvqSymLinear if m_side["tensors"][key].get("kind", "sb6") == "sym" else RwkvqLinear
+        ws = cls.from_sidecar(sidecar, key)._dequant_w_as(mx.float32)
+        wd = cls.from_sidecar(rwkvq, key)._dequant_w_as(mx.float32)
         mx.eval(ws, wd)
         s = np.array(ws.astype(mx.float32))
         d = np.array(wd.astype(mx.float32))

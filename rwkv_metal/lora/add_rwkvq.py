@@ -40,7 +40,7 @@ def _backend_for(sidecar_path: str, key: str, native):
     from .rwkvq_linear import (QUANTIZED_KINDS, RwkvqDenseLinear,
                                RwkvqSymLinear, load_sidecar)
     _, manifest = load_sidecar(sidecar_path)
-    if key not in manifest["tensors"] and _file_kind(sidecar_path, key) == "dense":
+    if _file_kind(sidecar_path, key) == "dense":
         # Цель лежит в файле плотной (нынешние пресеты: o_proj слоя 0) --
         # это намерение файла, см. докстринг RwkvqDenseLinear.
         return RwkvqDenseLinear
@@ -73,6 +73,11 @@ def _file_kind(sidecar_path: str, key: str):
     from rwkv_quant.formats import codec
     p = os.path.expanduser(sidecar_path)
     if not os.path.isfile(p):
+        # прежний сайдкар export_mlx (08.10): его манифест полный, kind берётся из него
+        if os.path.exists(p + ".json"):
+            import json
+            with open(p + ".json") as f:
+                return json.load(f)["tensors"].get(key, {}).get("kind")
         return None
     try:
         full, _ = codec.open_rwkvq(p)
