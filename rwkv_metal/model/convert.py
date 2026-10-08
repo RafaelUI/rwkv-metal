@@ -183,8 +183,37 @@ class _Skipped:
         self.shape = tuple(shape)
 
 
+# ТИП ПЛОТНЫХ ПАРАМЕТРОВ МОДЕЛИ ИЗ .rwkvq (08.10). Всё, что не подменяется
+# квантованным модулем (emb, нормировки, миксы, low-rank ветки, small), прежде
+# приезжало в bf16, и от него bf16 становился весь остаточный поток, то есть
+# счёт всей неквантованной части модели. fp16 -- тот же размер, на три бита
+# мантиссы точнее; значения файла (fp16-норма rwkv-quant) в нём точны.
+# Замер (tests/_sess/probe_param_dtype_train_0810.py, REDUCTION, отложенный
+# текст, истина -- .pth в fp32): KL -3.5% [-5.2; -1.5] на 0.1B, -4.8% [-8.3;
+# -1.8] на 1.5B; fp32 не лучше fp16. Ошибка градиентов адаптеров к эталону
+# 2.6e-2 -> 1.0e-2 (1.5B), шаг обучения 1.5B T=512 тот же.
+# RWKVQ_PARAM_DTYPE=bf16 (или param_dtype=) возвращает прежнее поведение.
+PARAM_DTYPES = ("fp16", "bf16", "fp32")
+
+
+def resolve_param_dtype(param_dtype=None):
+    """None -> переменная RWKVQ_PARAM_DTYPE -> "fp16". Принимает строку или mx.Dtype."""
+    import mlx.core as mx
+    table = {"fp16": mx.float16, "float16": mx.float16, "bf16": mx.bfloat16,
+             "bfloat16": mx.bfloat16, "fp32": mx.float32, "float32": mx.float32}
+    if param_dtype is None:
+        param_dtype = os.environ.get("RWKVQ_PARAM_DTYPE", "fp16")
+    if isinstance(param_dtype, str):
+        if param_dtype not in table:
+            raise ValueError(f"param_dtype {param_dtype!r}: знаем {', '.join(PARAM_DTYPES)}")
+        return table[param_dtype]
+    if param_dtype not in (mx.float16, mx.bfloat16, mx.float32):
+        raise ValueError(f"param_dtype {param_dtype}: знаем {', '.join(PARAM_DTYPES)}")
+    return param_dtype
+
+
 def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
-                          verbose=True, pre_materialize_hook=None):
+                          verbose=True, pre_materialize_hook=None, param_dtype=None):
     """Как load_pretrained_partial(), но ИСТОЧНИК -- сам .rwkvq, без .pth.
 
     Зачем. Прежде квантованная база требовала ДВА файла: .rwkvq с
@@ -201,6 +230,9 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
     g_lora=16.
 
     Читается через rwkv_quant.formats.codec -- numpy, без torch.
+
+    param_dtype: тип плотных параметров (см. PARAM_DTYPES выше); None --
+    RWKVQ_PARAM_DTYPE, по умолчанию fp16.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_unflatten
@@ -208,6 +240,7 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
     from ..pretrain.config import PretrainConfig
     from .rwkv7_x070 import RWKV7X070
 
+    pdt = resolve_param_dtype(param_dtype)
     manifest, buf = codec.open_rwkvq(os.path.expanduser(rwkvq_path))
     n_layer = manifest["n_layer"]
     D, S, V = manifest["n_embd"], manifest["head_size"], manifest["vocab_size"]
@@ -252,7 +285,7 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
         if (meta["kind"] in QUANTIZED_KINDS or meta["kind"] == "dense") and key in skip_set:
             z[key] = _Skipped(meta["shape"])
             continue
-        z[key] = _dequant_to_bf16(manifest, buf, key)
+        z[key] = _dequant_to(manifest, buf, key, pdt)
         n_deq += 1
     if verbose:
         print(f"деквантовано {n_deq} тензоров, sb6 оставлено заглушками "
@@ -298,7 +331,7 @@ def load_pretrained_rwkvq(rwkvq_path, skip_official_keys, config=None,
     return m, config
 
 
-def load_pretrained(pth_path, config=None, verbose=True):
+def load_pretrained(pth_path, config=None, verbose=True, param_dtype=None):
     """Load official RWKV-7 x070 weights (.pth) into an RWKV7X070 model.
 
     torch-free: reads the torch zip/pickle directly into MLX arrays (bf16 kept).
@@ -320,6 +353,8 @@ def load_pretrained(pth_path, config=None, verbose=True):
     (`lora.load_rwkvq_model(path, rank=0)`), and comes back frozen -- the
     quantized codes have no gradient. Every consumer of load_pretrained
     (inference, embeddings, reranker tools) thereby reads both formats.
+    `param_dtype` applies to `.rwkvq` only (dense parameters, fp16 by default,
+    see `resolve_param_dtype`); a `.pth` keeps its bf16.
     """
     import os
     from mlx.utils import tree_flatten, tree_unflatten
@@ -329,7 +364,8 @@ def load_pretrained(pth_path, config=None, verbose=True):
     pth_path = os.path.expanduser(pth_path)
     if pth_path.endswith(".rwkvq"):
         from ..lora.add_rwkvq import load_rwkvq_model
-        model, cfg, _ = load_rwkvq_model(pth_path, rank=0, config=config, verbose=verbose)
+        model, cfg, _ = load_rwkvq_model(pth_path, rank=0, config=config, verbose=verbose,
+                                         param_dtype=param_dtype)
         return model, cfg
     z = load_pth(pth_path)
     n_layer = 1 + max(int(k.split('.')[1]) for k in z if k.startswith('blocks.'))
@@ -496,7 +532,13 @@ def save_converted(pth_path, out_path):
 
 
 def _dequant_to_bf16(manifest, buf, key):
-    """Деквант ключа сразу в bf16, ПОЛОСАМИ СТРОК.
+    """Прежнее имя (до 08.10): деквант в bf16. См. _dequant_to."""
+    import mlx.core as mx
+    return _dequant_to(manifest, buf, key, mx.bfloat16)
+
+
+def _dequant_to(manifest, buf, key, dtype):
+    """Деквант ключа сразу в dtype, ПОЛОСАМИ СТРОК.
 
     Прежде здесь стояло `mx.array(codec.dequant_key(...)).astype(bfloat16)`,
     и на emb 2.9B [65536, 2560] это держало разом три полноразмерные копии:
@@ -513,7 +555,7 @@ def _dequant_to_bf16(manifest, buf, key):
     from rwkv_quant.formats import codec
     parts = []
     for _a, _b, band in codec.dequant_key_bands(manifest, buf, key):
-        p = mx.array(band).astype(mx.bfloat16)
+        p = mx.array(band).astype(dtype)
         mx.eval(p)
         parts.append(p)
         del band

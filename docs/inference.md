@@ -220,6 +220,11 @@ head stay quantized, and quantized codes have no gradient. Everything that
 takes a base model — `Embedder`, `EmbeddingModel`, `Reranker` and the tools
 under `tools/` that take `--model` — accepts it as is.
 
+Dense parameters (embeddings, norms, low-rank branches) are loaded as fp16,
+which is 4–5% closer to the original model in KL than bf16 on `reduction`
+(`param_dtype="bf16"` restores the old behaviour; see
+[`lora.md`](./lora.md#qlora-on-a-quantized-rwkvq-base-rwkv-quant)).
+
 `load_pretrained` on a `.rwkvq` is `rk.lora.load_rwkvq_model(path, rank=0)`:
 the QLoRA loader with no adapters. Until 2026-10-08 inference had to go
 through the QLoRA loader with `rank=1`, which cost an extra matmul per

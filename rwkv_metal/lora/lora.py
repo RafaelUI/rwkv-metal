@@ -60,7 +60,10 @@ class LoRALinear(nn.Module):
         z = x @ self.lora_a.T
         if self.dropout is not None:
             z = self.dropout(z)
-        return base + self.scale * (z @ self.lora_b.T)
+        # Тип выхода -- тип базы (08.10). Адаптеры в bf16, а вход при fp16-параметрах
+        # модели -- fp16; без приведения fp16 x bf16 повышался до fp32, и нулевой
+        # адаптер менял тип счёта всей модели дальше по потоку. При bf16 -- no-op.
+        return base + (self.scale * (z @ self.lora_b.T)).astype(base.dtype)
 
     def merged_weight(self, dtype=None):
         """Плотный вес базы + дельта адаптера. База -- любая (см. dense_weight):

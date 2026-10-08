@@ -226,7 +226,7 @@ def load_rwkvq_model(rwkvq_path, rank: int = 16, alpha: float = 32.0,
                      dropout: float = 0.0, tmix_targets=TMIX_TARGETS,
                      quantize_cmix: bool = True, quantize_head: bool = True,
                      layers=None, config=None, verbose: bool = True,
-                     native: bool = True):
+                     native: bool = True, param_dtype=None):
     """QLoRA-модель ИЗ ОДНОГО .rwkvq. Ни .pth, ни сайдкара не нужно.
 
     Прежний вход (load_lora_rwkvq_model) требовал .pth ради тензоров,
@@ -242,6 +242,10 @@ def load_rwkvq_model(rwkvq_path, rank: int = 16, alpha: float = 32.0,
 
     rank=0 -- только инференс (эмбеддинги, реранкер, генерация): проекции
     остаются голыми квантованными слоями, адаптеров нет.
+
+    param_dtype -- тип плотных параметров модели (emb, нормы, миксы, low-rank
+    ветки): "fp16" (умолчание с 08.10), "bf16" (прежнее), "fp32"; None --
+    RWKVQ_PARAM_DTYPE. Замер -- model/convert.py, PARAM_DTYPES.
     """
     from ..model.convert import load_pretrained_rwkvq
     from rwkv_quant.formats import codec
@@ -259,7 +263,8 @@ def load_rwkvq_model(rwkvq_path, rank: int = 16, alpha: float = 32.0,
 
     model, cfg = load_pretrained_rwkvq(rwkvq_path, skip_keys, config=config,
                                        verbose=verbose,
-                                       pre_materialize_hook=hook)
+                                       pre_materialize_hook=hook,
+                                       param_dtype=param_dtype)
     if model is None:
         raise RuntimeError("load_pretrained_rwkvq: конверсия не чистая")
 

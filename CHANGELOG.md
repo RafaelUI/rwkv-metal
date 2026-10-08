@@ -33,12 +33,17 @@
 
 ### Changed
 
+- **Dense parameters of a `.rwkvq` model load as fp16** (embeddings, norms,
+  mixes, low-rank branches; were bf16). Same memory and step time; KL to the
+  original checkpoint -4.3% (0.1B) and -5.2% (1.5B) on `reduction`, adapter
+  gradient error vs an fp32 reference 2.8e-2 -> 1.0e-2 (1.5B). `param_dtype=`
+  / `RWKVQ_PARAM_DTYPE=bf16` restores the previous outputs bit for bit.
 - The quantized base is dequantized and multiplied in fp16 (the `rwkv-quant`
   norm), backward in bf16: KL to the original checkpoint -5.4% (0.1B) and
   -9.8% (1.5B) on `reduction`, +1.4% step time. `RWKVQ_BASE_DTYPE=bf16`
   restores the previous behaviour.
 
-Gates: `tests/test_rwkvq_downstream.py`, `test_rwkvq_dense_target.py`,
+Gates: `tests/test_rwkvq_downstream.py`, `test_param_dtype.py`, `test_rwkvq_dense_target.py`,
 `test_base_dtype.py`, `test_load_memory.py`, `test_ranks_from_shapes.py`.
 
 ## 0.3.2

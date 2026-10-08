@@ -264,6 +264,27 @@ T=512: +1.4% time, +56 MB peak. `RWKVQ_BASE_DTYPE=bf16` (or
 `RWKVQ_BWD_DTYPE=fp32|bf16|same` selects the backward type. Gate:
 `tests/test_base_dtype.py`.
 
+**Precision of the rest of the model.** Everything the file does not keep
+quantized — embeddings, norms, token-shift mixes, the low-rank branches — is
+loaded as fp16 since 2026-10-08 (`param_dtype=` of `load_rwkvq_model` /
+`load_pretrained`, or `RWKVQ_PARAM_DTYPE=fp16|bf16|fp32`). It used to be bf16,
+which set the precision of every computation outside the quantized layers.
+fp16 has the same size and three more mantissa bits, and the file's values are
+exact in it. Measured on held-out text against the original checkpoint in fp32
+(`tests/_sess/probe_param_dtype_load_0810.py`):
+
+| | KL, fp16 vs bf16 | adapter-gradient error vs fp32 reference, bf16 → fp16 |
+|---|---|---|
+| 0.1B `reduction` | −4.3% [−5.6; −2.7] | 3.2e-2 → 9.0e-3 |
+| 1.5B `reduction` | −5.2% [−9.0; −1.9] | 2.8e-2 → 1.0e-2 |
+| 1.5B `compression` | −0.4% [−2.5; +1.1] (not significant) | 2.7e-2 → 3.9e-3 |
+
+fp32 is no better than fp16 here and costs +350 MB at 1.5B. With fp16 the 1.5B
+training step (T=512) takes the same time and the same peak memory as with
+bf16. On 2.9B fp16 gives finite logits and gradients and agrees with bf16 to
+KL 5e-5 (no overflow); 7.2B and larger were not checked. `param_dtype="bf16"`
+reproduces the previous outputs bit for bit. Gate: `tests/test_param_dtype.py`.
+
 The `.pth` used to be required alongside the quantized file, for the tensors a
 sidecar never carried: normalisations, token-shift multipliers, the low-rank
 lora branches, embeddings. On 2.9B that is 5.9 GB fetched and read to obtain
