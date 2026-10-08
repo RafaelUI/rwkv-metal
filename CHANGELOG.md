@@ -23,6 +23,13 @@
 - **`merge_lora()` over a quantized base** added the delta to the packed codes
   of `nn.QuantizedLinear` and failed on `.rwkvq` bases. Merged projections now
   become dense `nn.Linear`; layers without adapters stay quantized and frozen.
+- **The `export_mlx` sidecar route failed on current presets**: the dense
+  target was rejected and `reduction`'s `sym` tensors were not built.
+  `load_lora_rwkvq_model(pth, sidecar)` now matches `(pth, .rwkvq)` bit for bit
+  on both presets (needs `SymQuantLinear.from_interleaved` from `rwkv-quant`).
+- `RwkvqNativeLinear` keeps scale / bias in fp16 wherever that leaves the
+  weights unchanged (134 of 144 tensors on 1.5B `compression`): -139 MiB
+  active memory, outputs and gradients bit-identical.
 - Current `rwkv-quant` preset files open for QLoRA: the target stored dense
   (layer 0 output projection) gets a frozen dense base.
 - Low-rank branch ranks come from the checkpoint shapes, so `rwkv7-g1d-0.4b`
@@ -43,7 +50,8 @@
   -9.8% (1.5B) on `reduction`, +1.4% step time. `RWKVQ_BASE_DTYPE=bf16`
   restores the previous behaviour.
 
-Gates: `tests/test_rwkvq_downstream.py`, `test_param_dtype.py`, `test_rwkvq_dense_target.py`,
+Gates: `tests/test_rwkvq_downstream.py`, `test_param_dtype.py`,
+`test_native_scale_fp16.py`, `test_sidecar_presets.py`, `test_rwkvq_dense_target.py`,
 `test_base_dtype.py`, `test_load_memory.py`, `test_ranks_from_shapes.py`.
 
 ## 0.3.2
