@@ -96,7 +96,8 @@ def props():
         finally:
             rl.HOST_BAND_MB = BAND0
         multi += sh[0] > int(TINY * 2 ** 20) // (6 * sh[1])
-        if not (eq(nat.wq, wq_ref) and eq(nat.scale, scale) and eq(nat.bias, bias)): bad.append(k)
+        # scale / bias с 08.10 хранятся в fp16, где это точно (test_native_scale_fp16) -- сверяются значения
+        if not (eq(nat.wq, wq_ref) and eq(nat.scale.astype(mx.float32), scale) and eq(nat.bias.astype(mx.float32), bias)): bad.append(k)
     check("L2 родная упаковка полосами == целиком (%d форм, включая голову)" % len(reps), not bad and "head.weight" in reps.values(), bad)
     check("L2 полос больше одной у %d из %d форм" % (multi, len(reps)), multi == len(reps))
     k3_bytes = sum(arrays[f"{k}::{n}"].nbytes for k in sb6 for n in ("qblk", "qsqm", "ddm"))

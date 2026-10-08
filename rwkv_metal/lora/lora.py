@@ -114,8 +114,10 @@ def dense_weight(mod, dtype=None) -> mx.array:
             scale, bias = mod._expand_scale_bias()
         else:                                           # RwkvqNativeLinear
             scale, bias = mod.scale, mod.bias
-        w = mx.dequantize(mod.wq, scale, bias, group_size=GROUP_SIZE,
-                          bits=mod.bits).astype(mx.float32)
+        # scale / bias бывают fp16 (RwkvqNativeLinear с 08.10): dequantize считает в их
+        # типе, поэтому -- в fp32, как quantized_matmul на fp32-входе
+        w = mx.dequantize(mod.wq, scale.astype(mx.float32), bias.astype(mx.float32),
+                          group_size=GROUP_SIZE, bits=mod.bits)
     else:
         raise TypeError(f"dense_weight: {type(mod).__name__} -- не линейный слой")
     return w.astype(dtype or mx.float32)

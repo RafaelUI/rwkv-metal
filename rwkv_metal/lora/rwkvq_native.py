@@ -117,6 +117,21 @@ class RwkvqNativeLinear(nn.Module):
         # на хосте: int32-коды (4 байта на вес) + упакованные слова и scale / bias
         rows = _rl._band_rows(6 * self.in_features)
         self.wq, self.scale, self.bias = _rl._mx_bands(band, self.out_features, rows)
+        # scale / bias храним в fp16 (08.10): значения sb6 и так округлены в fp16
+        # (см. _codes_scale_bias), а fp32 занимал вдвое больше -- 319 МиБ на 1.5B
+        # COMPRESSION. quantized_matmul с fp32-входом и fp16-scale даёт тот же выход
+        # побитно. scale на зажиме 1e-8 (блоки с нулевым scale, напр. cmix.key 1.5B) в fp16
+        # обнуляется; это безопасно, если веса от этого не меняются (коды таких блоков
+        # нулевые) -- тогда сверяется деквант целиком, иначе тензор остаётся в fp32.
+        s16, b16 = self.scale.astype(mx.float16), self.bias.astype(mx.float16)
+        exact = bool(mx.array_equal(s16.astype(mx.float32), self.scale)) and \
+            bool(mx.array_equal(b16.astype(mx.float32), self.bias))
+        if not exact and bool(mx.array_equal(b16.astype(mx.float32), self.bias)):
+            kw = dict(group_size=GROUP_SIZE, bits=self.bits)
+            exact = bool(mx.array_equal(mx.dequantize(self.wq, s16.astype(mx.float32), self.bias, **kw),
+                                        mx.dequantize(self.wq, self.scale, self.bias, **kw)))
+        if exact:
+            self.scale, self.bias = s16, b16
         self.freeze()
 
     @classmethod
