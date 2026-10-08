@@ -35,8 +35,8 @@
 
 - **Dense parameters of a `.rwkvq` model load as fp16** (embeddings, norms,
   mixes, low-rank branches; were bf16). Same memory and step time; KL to the
-  original checkpoint -4.3% (0.1B) and -5.2% (1.5B) on `reduction`, adapter
-  gradient error vs an fp32 reference 2.8e-2 -> 1.0e-2 (1.5B). `param_dtype=`
+  original checkpoint -4.0% (0.1B) and -5.2% (1.5B) on `reduction`, adapter
+  gradient error vs an fp32 reference 2.8e-2 -> 1.2e-2 (1.5B). `param_dtype=`
   / `RWKVQ_PARAM_DTYPE=bf16` restores the previous outputs bit for bit.
 - The quantized base is dequantized and multiplied in fp16 (the `rwkv-quant`
   norm), backward in bf16: KL to the original checkpoint -5.4% (0.1B) and

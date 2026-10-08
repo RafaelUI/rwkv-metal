@@ -275,13 +275,13 @@ exact in it. Measured on held-out text against the original checkpoint in fp32
 
 | | KL, fp16 vs bf16 | adapter-gradient error vs fp32 reference, bf16 → fp16 |
 |---|---|---|
-| 0.1B `reduction` | −4.3% [−5.6; −2.7] | 3.2e-2 → 9.0e-3 |
-| 1.5B `reduction` | −5.2% [−9.0; −1.9] | 2.8e-2 → 1.0e-2 |
-| 1.5B `compression` | −0.4% [−2.5; +1.1] (not significant) | 2.7e-2 → 3.9e-3 |
+| 0.1B `reduction` | −4.0% [−5.3; −2.5] | 3.2e-2 → 9.3e-3 |
+| 1.5B `reduction` | −5.2% [−8.7; −2.2] | 2.8e-2 → 1.2e-2 |
+| 1.5B `compression` | −0.4% [−2.5; +1.1] (not significant) | 2.7e-2 → 4.0e-3 |
 
 fp32 is no better than fp16 here and costs +350 MB at 1.5B. With fp16 the 1.5B
-training step (T=512) takes the same time and the same peak memory as with
-bf16. On 2.9B fp16 gives finite logits and gradients and agrees with bf16 to
+training step (T=512) takes the same time (−1.1% `reduction`, −0.1%
+`compression`, A/B in one process) and the same peak memory as with bf16. On 2.9B fp16 gives finite logits and gradients and agrees with bf16 to
 KL 5e-5 (no overflow); 7.2B and larger were not checked. `param_dtype="bf16"`
 reproduces the previous outputs bit for bit. Gate: `tests/test_param_dtype.py`.
 
