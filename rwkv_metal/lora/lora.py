@@ -62,9 +62,106 @@ class LoRALinear(nn.Module):
             z = self.dropout(z)
         return base + self.scale * (z @ self.lora_b.T)
 
-    def merged_weight(self):
-        delta = self.scale * (self.lora_b @ self.lora_a)
-        return self.linear.weight + delta.astype(self.linear.weight.dtype)
+    def merged_weight(self, dtype=None):
+        """Плотный вес базы + дельта адаптера. База -- любая (см. dense_weight):
+        прежде здесь стояло `self.linear.weight + delta`, что у nn.QuantizedLinear
+        складывало дельту с УПАКОВАННЫМИ uint32-кодами, а у баз .rwkvq падало
+        (атрибута weight у них нет). dtype=None -- тип плотной базы, у
+        квантованной -- тип адаптеров."""
+        if dtype is None:
+            dtype = (self.linear.weight.dtype if type(self.linear) is nn.Linear
+                     else self.lora_a.dtype)
+        return dense_weight(self, dtype)
+
+
+def is_linear_like(mod) -> bool:
+    """Линейный слой любой базы: nn.Linear, nn.QuantizedLinear, LoRALinear и
+    замороженные базы .rwkvq (RwkvqLinear / RwkvqSymLinear / RwkvqDenseLinear --
+    по _dequant_w_as, RwkvqNativeLinear / RwkvqHybridLinear -- по wq)."""
+    return (isinstance(mod, (nn.Linear, nn.QuantizedLinear, LoRALinear))
+            or hasattr(mod, "_dequant_w_as")
+            or (isinstance(mod, nn.Module) and "wq" in mod and hasattr(mod, "bits")))
+
+
+def dense_weight(mod, dtype=None) -> mx.array:
+    """Плотный вес [OUT, IN] линейного слоя любой базы (08.10).
+
+    Зачем. Всё, что читает веса модели по именам (`init_from_base`
+    реранкера, merge_lora, экспорт), видело у квантованной базы не
+    `weight`, а коды и масштабы, и молча пропускало такие слои: голова
+    реранкера над .rwkvq-базой стартовала со СЛУЧАЙНЫМИ проекциями.
+
+    Деквант -- в fp32 (значения .rwkvq точны в fp16, fp32 их не портит),
+    LoRALinear -- база плюс scale * B @ A в fp32. dtype=None -- fp32, кроме
+    плотного nn.Linear, который отдаётся в своём типе как есть."""
+    from .rwkvq_native import GROUP_SIZE
+    if isinstance(mod, LoRALinear):
+        w = dense_weight(mod.linear, mx.float32)
+        w = w + mod.scale * (mod.lora_b.astype(mx.float32) @ mod.lora_a.astype(mx.float32))
+    elif isinstance(mod, nn.QuantizedLinear):
+        w = mx.dequantize(mod.weight, mod.scales, mod.biases,
+                          group_size=mod.group_size, bits=mod.bits).astype(mx.float32)
+    elif isinstance(mod, nn.Linear):
+        w = mod.weight
+        return w if dtype is None else w.astype(dtype)
+    elif hasattr(mod, "_dequant_w_as"):
+        w = mod._dequant_w_as(mx.float32)
+    elif isinstance(mod, nn.Module) and "wq" in mod:
+        if hasattr(mod, "_expand_scale_bias"):          # RwkvqHybridLinear
+            scale, bias = mod._expand_scale_bias()
+        else:                                           # RwkvqNativeLinear
+            scale, bias = mod.scale, mod.bias
+        w = mx.dequantize(mod.wq, scale, bias, group_size=GROUP_SIZE,
+                          bits=mod.bits).astype(mx.float32)
+    else:
+        raise TypeError(f"dense_weight: {type(mod).__name__} -- не линейный слой")
+    return w.astype(dtype or mx.float32)
+
+
+def _linear_bias(mod):
+    """Смещение линейного слоя. Только у nn.Linear / nn.QuantizedLinear: у
+    RwkvqNativeLinear `bias` -- это сдвиг КВАНТОВАНИЯ [OUT, NB], не слоя."""
+    base = mod.linear if isinstance(mod, LoRALinear) else mod
+    if isinstance(base, (nn.Linear, nn.QuantizedLinear)) and "bias" in base:
+        return base["bias"]
+    return None
+
+
+def dense_parameters(module, dtype=None) -> dict:
+    """Плоский словарь параметров `module` в ПЛОТНОМ виде: каждый линейный
+    слой любой базы -- как `<путь>.weight` (+ `.bias`, если есть), остальное --
+    как в tree_flatten(module.parameters()). Ключи совпадают с ключами той же
+    архитектуры на плотных nn.Linear, поэтому результат годится для update()
+    плотной копии (голова реранкера, экспорт)."""
+    out = {}
+
+    def walk(m, prefix):
+        if is_linear_like(m):
+            out[prefix + "weight"] = dense_weight(m, dtype)
+            b = _linear_bias(m)
+            if b is not None:
+                out[prefix + "bias"] = b
+            return
+        for k, v in m.items():
+            if k.startswith("_"):
+                continue
+            if isinstance(v, mx.array):
+                out[prefix + k] = v
+            elif isinstance(v, nn.Module):
+                walk(v, f"{prefix}{k}.")
+            elif isinstance(v, (list, tuple)):
+                for i, c in enumerate(v):
+                    if isinstance(c, nn.Module):
+                        walk(c, f"{prefix}{k}.{i}.")
+                    elif isinstance(c, mx.array):
+                        out[f"{prefix}{k}.{i}"] = c
+            elif isinstance(v, dict):
+                for kk, vv in tree_flatten(v):
+                    if isinstance(vv, mx.array):
+                        out[f"{prefix}{k}.{kk}"] = vv
+
+    walk(module, "")
+    return out
 
 
 TMIX_TARGETS = ("r_proj", "k_proj", "v_proj", "o_proj")
@@ -148,25 +245,49 @@ def load_lora(model, path):
     return model
 
 
-def merge_lora(model):
-    """In-place слияние LoRA обратно в базовые nn.Linear (для inference/экспорта)."""
+def _merged_linear(lora: "LoRALinear", dtype=None) -> nn.Linear:
+    """LoRALinear -> плотный nn.Linear с влитым адаптером. Плотная база
+    переиспользуется (как прежде); квантованная (QLoRA) становится плотной:
+    слить дельту в коды без переквантования нельзя, а переквантование --
+    дело rwkv-quant, не этого слияния."""
+    w = lora.merged_weight(dtype)
+    if type(lora.linear) is nn.Linear:
+        lora.linear.weight = w
+        return lora.linear
+    OUT, IN = w.shape
+    lin = nn.Linear(IN, OUT, bias=_linear_bias(lora) is not None)
+    lin.weight = w
+    if "bias" in lin:
+        lin.bias = _linear_bias(lora)
+    return lin
+
+
+def merge_lora(model, dtype=None):
+    """In-place слияние LoRA обратно в базу (для inference/экспорта).
+
+    Плотная база -- как прежде: вес nn.Linear получает дельту в своём типе.
+    Квантованная база (QLoRA: nn.QuantizedLinear или .rwkvq) -- слой
+    становится плотным nn.Linear в типе адаптеров (bf16) либо `dtype`;
+    память этого слоя растёт до плотной. Незавёрнутые квантованные слои
+    (cmix, head у .rwkvq) остаются как есть."""
     def replace_in(parent):
         for cname, child in list(parent.children().items()):
             if isinstance(child, LoRALinear):
-                base = child.linear
-                base.weight = child.merged_weight()
-                setattr(parent, cname, base)
+                setattr(parent, cname, _merged_linear(child, dtype))
             elif isinstance(child, nn.Module):
                 replace_in(child)
             elif isinstance(child, list):
                 for i, c in enumerate(child):
                     if isinstance(c, LoRALinear):
-                        base = c.linear
-                        base.weight = c.merged_weight()
-                        child[i] = base
+                        child[i] = _merged_linear(c, dtype)
                     elif isinstance(c, nn.Module):
                         replace_in(c)
     replace_in(model)
     model.unfreeze()
+    # квантованные слои, оставшиеся квантованными, обучаемыми не становятся:
+    # у их целочисленных кодов градиента нет
+    for _, m in model.named_modules():
+        if is_linear_like(m) and not isinstance(m, nn.Linear):
+            m.freeze()
     mx.eval(model.parameters())
     return model

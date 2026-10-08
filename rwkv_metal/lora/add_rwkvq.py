@@ -151,6 +151,11 @@ def _replace_targets_with_rwkvq(model, sidecar_path: str, rank: int, alpha: floa
                 continue
             key = f"blocks.{li}.att.{_TMIX_KEY[name]}.weight"
             base = _from_sidecar(sidecar_path, key)
+            if rank == 0:
+                # только инференс (08.10): база без адаптера, без лишнего
+                # матмула на проекцию и без LoRA-параметров
+                setattr(blk.tmix, name, base)
+                continue
             setattr(blk.tmix, name, LoRALinear(rank=rank, alpha=alpha,
                                                 dropout=dropout, base_module=base))
             wrapped.append(f"tmix.{name}")
@@ -234,6 +239,9 @@ def load_rwkvq_model(rwkvq_path, rank: int = 16, alpha: float = 32.0,
     на 2.9B, две трети сдвига даёт g_lora
     (rwkv-quant/tests/ablate_qlora_lora_source.py). Прежний вход
     оставлен для случая, когда этот сдвиг неприемлем.
+
+    rank=0 -- только инференс (эмбеддинги, реранкер, генерация): проекции
+    остаются голыми квантованными слоями, адаптеров нет.
     """
     from ..model.convert import load_pretrained_rwkvq
     from rwkv_quant.formats import codec

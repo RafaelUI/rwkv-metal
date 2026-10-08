@@ -314,6 +314,12 @@ def load_pretrained(pth_path, config=None, verbose=True):
         (model, config). model is an RWKV7X070 with weights loaded; config is the
         PretrainConfig used to build it. Returns (None, config) if conversion is
         not clean (missing/extra/mismatched keys) so problems fail loudly.
+
+    A quantized `.rwkvq` (rwkv-quant) is accepted too (08.10): the model then
+    keeps its projections, FFN and head quantized, with no adapters
+    (`lora.load_rwkvq_model(path, rank=0)`), and comes back frozen -- the
+    quantized codes have no gradient. Every consumer of load_pretrained
+    (inference, embeddings, reranker tools) thereby reads both formats.
     """
     import os
     from mlx.utils import tree_flatten, tree_unflatten
@@ -321,6 +327,10 @@ def load_pretrained(pth_path, config=None, verbose=True):
     from .rwkv7_x070 import RWKV7X070
 
     pth_path = os.path.expanduser(pth_path)
+    if pth_path.endswith(".rwkvq"):
+        from ..lora.add_rwkvq import load_rwkvq_model
+        model, cfg, _ = load_rwkvq_model(pth_path, rank=0, config=config, verbose=verbose)
+        return model, cfg
     z = load_pth(pth_path)
     n_layer = 1 + max(int(k.split('.')[1]) for k in z if k.startswith('blocks.'))
     V, D = z['emb.weight'].shape

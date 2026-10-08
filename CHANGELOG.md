@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`load_pretrained()` reads `.rwkvq`.** It returns the quantized model with
+  no adapters (`lora.load_rwkvq_model(path, rank=0)`), frozen. Inference,
+  `Embedder` / `EmbeddingModel`, `Reranker` and the `--model` tools therefore
+  take a file of either current `rwkv-quant` preset (`reduction` in `sym`,
+  `compression` in `sb6`). `load_rwkvq_model(rank=0)` is the same without the
+  wrapper.
+- `lora.dense_weight()` / `dense_parameters()`: the dense weight of a linear
+  layer over any base (`nn.Linear`, `nn.QuantizedLinear`, `LoRALinear`, every
+  `.rwkvq` backend), bit-identical to `rwkv_quant.formats.codec`.
+
+### Fixed
+
+- **Reranker head over a quantized or LoRA-wrapped base started with random
+  projections.** `init_from_base` copied parameters by name, and such a base
+  has no `weight` under r/k/v/o and the FFN; the misses were silent. It now
+  copies dequantized (plus adapter) weights and raises if anything is missing.
+- **`merge_lora()` over a quantized base** added the delta to the packed codes
+  of `nn.QuantizedLinear` and failed on `.rwkvq` bases. Merged projections now
+  become dense `nn.Linear`; layers without adapters stay quantized and frozen.
+- Current `rwkv-quant` preset files open for QLoRA: the target stored dense
+  (layer 0 output projection) gets a frozen dense base.
+- Low-rank branch ranks come from the checkpoint shapes, so `rwkv7-g1d-0.4b`
+  (g rank 128, formula 160) opens from `.pth` and `.rwkvq`.
+- Loading a `.rwkvq` QLoRA base no longer keeps host and cache memory it no
+  longer needs (1.5B `compression`: footprint 5.4 -> 1.7 GB, load peak
+  5.6 -> 3.3 GB).
+
+### Changed
+
+- The quantized base is dequantized and multiplied in fp16 (the `rwkv-quant`
+  norm), backward in bf16: KL to the original checkpoint -5.4% (0.1B) and
+  -9.8% (1.5B) on `reduction`, +1.4% step time. `RWKVQ_BASE_DTYPE=bf16`
+  restores the previous behaviour.
+
+Gates: `tests/test_rwkvq_downstream.py`, `test_rwkvq_dense_target.py`,
+`test_base_dtype.py`, `test_load_memory.py`, `test_ranks_from_shapes.py`.
+
 ## 0.3.2
 
 ### Fixed

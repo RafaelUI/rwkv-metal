@@ -63,6 +63,8 @@ import rwkv_metal as rk
 from rwkv_metal.reranker import Reranker, RerankerInference
 
 base, cfg = rk.load_pretrained("weights/rwkv7-g1d-0.1b.pth")
+# a quantized base works the same way: rk.load_pretrained("model.rwkvq");
+# the head blocks are then initialized from the dequantized layer weights
 
 # reads which layers the head was trained on straight from the checkpoint
 model = Reranker.from_head(base, "reranker_head.safetensors")

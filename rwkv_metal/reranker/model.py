@@ -157,12 +157,22 @@ class RerankerHead(nn.Module):
         выключается вместо того, чтобы остаться случайной.
         """
         from mlx.utils import tree_flatten, tree_unflatten
+        from ..lora.lora import dense_parameters
 
         for i, src_idx in enumerate(self.layer_idx):
-            src = dict(tree_flatten(base.blocks[src_idx].parameters()))
+            # dense_parameters, а не parameters() (08.10): у LoRA- и
+            # квантованной базы (.rwkvq, QLoRA) проекции лежат не как
+            # `weight`, и прежний код молча оставлял их случайными.
+            src = dense_parameters(base.blocks[src_idx])
             dst_keys = set(k for k, _ in tree_flatten(self.blocks[i].parameters()))
             upd = {k: v for k, v in src.items() if k in dst_keys}
             self.blocks[i].update(tree_unflatten(list(upd.items())))
+            # молчаливый пропуск -- ровно та ошибка, что здесь жила: кроме
+            # value-residual (обрабатывается ниже) всё обязано найтись в базе
+            lost = sorted(k for k in dst_keys - set(upd) if not k.startswith("tmix.v_lora"))
+            if lost:
+                raise ValueError(f"init_from_base: в слое {src_idx} базы нет {len(lost)} "
+                                 f"параметров головы, напр. {lost[:3]}")
 
             missing_v = [k for k in dst_keys
                          if k.startswith("tmix.v_lora") and k not in src]

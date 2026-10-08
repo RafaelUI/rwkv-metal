@@ -29,9 +29,9 @@ There are two ways to get weights into that model:
 | | bf16 | quantized (`.rwkvq`) |
 |---|---|---|
 | Where the weights come from | `.pth` (official World checkpoint) or your own pretrain/finetune output | `rwkv-quant` (separate repo) quantizes a `.pth` into `.rwkvq`, which is read directly |
-| Loader | `rk.load_pretrained(...)` | `rk.lora.load_lora_rwkvq_model(...)` |
+| Loader | `rk.load_pretrained("model.pth")` | `rk.load_pretrained("model.rwkvq")` (same function) |
 | Memory | full size (e.g. ~3 GB for World 1.5B) | 2–3× smaller (REDUCTION/COMPRESSION presets) |
-| Dependencies | `rwkv_metal` only | `rwkv_metal` + a one-time `rwkv-quant` export step (torch, run separately — see below) |
+| Dependencies | `rwkv_metal` only | `rwkv_metal` + the `rwkv-quant` reader (numpy only); writing the file needs torch, once |
 
 Both paths produce an ordinary `rwkv_metal` model you call the same way —
 `model(idx)` — the difference is only in how the weights got there.
@@ -183,15 +183,17 @@ quantizes and exports, **rwkv-metal** loads and runs.
 cd rwkv-quant
 python -c "
 from rwkv_quant.api import quantize
-quantize('weights/RWKV-x070-World-1.5B.pth', '/tmp/world15b.rwkvq', preset='reduction')
+quantize('weights/RWKV-x070-World-1.5B.pth', '/tmp/world15b.rwkvq',
+         preset='reduction', tokenizer='rwkv_vocab_v20230424.txt')
 "
 ```
 
-`preset` is `"reduction"` (near-zero quality loss, ~2.35× smaller, the
+`preset` is `"reduction"` (near-zero quality loss, 2.0–2.15× smaller, the
 validated default for a quantized *base* you intend to keep accurate) or
-`"compression"` (~3× smaller, a small but real quality cost — see
+`"compression"` (2.8–3.1× smaller, a small but real quality cost — see
 [`lora.md`](./lora.md#qlora-on-a-quantized-rwkvq-base-rwkv-quant) for the
-tradeoff).
+numbers). `tokenizer` is required: `quantize()` collects activation statistics
+with the checkpoint's own vocabulary.
 
 **No export step is needed.** This used to say that `export_mlx` was
 mandatory, because `.rwkvq` was a torch pickle and the loader layout could
@@ -208,33 +210,27 @@ bit-identical weights.
 ```python
 import rwkv_metal as rk
 
-model, cfg, info = rk.lora.load_rwkvq_model(
-    "/tmp/world15b.rwkvq",                # one file, nothing else
-    rank=1,                               # see note below — no adapter training happening here
-)
+model, cfg = rk.load_pretrained("/tmp/world15b.rwkvq")   # one file, nothing else
 tok = rk.WorldTokenizer()
 ```
 
 Generation from here is identical to the bf16 case — `model(idx)` returns
-logits, sample as above.
+logits, sample as above. The model comes back frozen: projections, FFN and
+head stay quantized, and quantized codes have no gradient. Everything that
+takes a base model — `Embedder`, `EmbeddingModel`, `Reranker` and the tools
+under `tools/` that take `--model` — accepts it as is.
 
-### Why `rank=1` and no training
-
-`load_lora_rwkvq_model` / `add_lora_rwkvq` are QLoRA entry points — they wrap
-each quantized projection in a `LoRALinear`. There is currently no separate
-"just load quantized weights, no adapter" function. That is not a correctness
-problem: `LoRALinear`'s adapter (`lora_b`) is zero-initialized, so an untrained
-adapter is a mathematical no-op — `model(idx)` returns exactly the quantized
-model's output, plus one small extra matmul per wrapped projection. Use the
-smallest `rank` you're comfortable with (`rank=1` minimizes that overhead) if
-you only want inference. If you *do* want to fine-tune on top of the quantized
-base, see [`lora.md`](./lora.md#qlora-on-a-quantized-rwkvq-base-rwkv-quant).
+`load_pretrained` on a `.rwkvq` is `rk.lora.load_rwkvq_model(path, rank=0)`:
+the QLoRA loader with no adapters. Until 2026-10-08 inference had to go
+through the QLoRA loader with `rank=1`, which cost an extra matmul per
+projection. To fine-tune on top of the quantized base, see
+[`lora.md`](./lora.md#qlora-on-a-quantized-rwkvq-base-rwkv-quant).
 
 ### Backend choice (`native=`)
 
 ```python
-model, cfg, info = rk.lora.load_lora_rwkvq_model(pth_path, sidecar_path,
-                                                  rank=1, native=True)
+model, cfg, info = rk.lora.load_rwkvq_model("/tmp/world15b.rwkvq",
+                                            rank=0, native=True)
 ```
 
 | `native=` | What it does | Best for |
@@ -243,10 +239,10 @@ model, cfg, info = rk.lora.load_lora_rwkvq_model(pth_path, sidecar_path,
 | `False` | Custom fused Metal dequant kernel (`rwkvq_kernel.py`), one launch per weight | Best memory/speed balance; no dependency on MLX-internal packing details; ~1.5× slower than `native=True` |
 | `"hybrid"` | Native code layout + compact scale/bias unpacked on the fly | Rarely the right choice — didn't beat the other two in measurement, kept for reference |
 
-`native=True` is only verified against `bits=6` (the REDUCTION preset) — it
-reverse-engineers MLX's internal packing, which differs by bit width.
-`native=False` (the fused kernel) is bit-width generic and works for both
-REDUCTION and COMPRESSION.
+`native=` applies to `sb6` tensors, which means the COMPRESSION preset; MLX's
+packing rule behind `native=True` is verified at 4, 5, 6 and 8 bits. REDUCTION
+stores `sym` (blocks of 16, no native MLX kernel), so its tensors always use
+the dedicated `sym` kernel whatever `native=` says.
 
 ---
 
@@ -416,14 +412,15 @@ numbers are all in **[`reranker.md`](./reranker.md)**.
   exists only to reproduce checkpoints trained before the token-shift fix, and
   in that mode a continuation cannot be defined — see
   [`reranker.md`](./reranker.md#the-rwkv7-token-shift-leak-fixed).
-- **`emb.weight` is never quantized**, even in the `.rwkvq` path — embedding
-  lookup is a gather, not a matmul, so it stays bf16 regardless of preset.
-- **`merge_lora()` doesn't apply to `.rwkvq`-based adapters.** It writes the
-  adapter delta into `linear.weight`, but `RwkvqLinear`/`RwkvqNativeLinear`
-  have no dense `.weight` — the base is dequantized on the fly. If you trained
-  a QLoRA adapter on a quantized base, keep base + adapter composed at
-  inference time (the normal `LoRALinear.__call__` path); there's no built-in
-  "bake the adapter into a smaller quantized file" step yet.
+- **`emb.weight` is held dense in memory** in the `.rwkvq` path. The file
+  stores it quantized, but embedding lookup is a gather, not a matmul, so the
+  table is dequantized once at load (bf16) regardless of preset.
+- **`merge_lora()` over a quantized base makes the merged layers dense.** A
+  delta cannot be folded into quantized codes without re-quantizing, so each
+  wrapped projection becomes a dense `nn.Linear` (dequantized weight +
+  adapter); memory grows by those layers' dense size. Keep base + adapter
+  composed to stay small; there's no built-in "bake the adapter into a new
+  quantized file" step yet.
 
 See also: [`lora.md`](./lora.md) for fine-tuning, [`pretraining.md`](./pretraining.md)
 for training from scratch, [`embedding.md`](./embedding.md) for text embeddings.

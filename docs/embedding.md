@@ -56,6 +56,7 @@ import rwkv_metal as rk
 from rwkv_metal.embedding import Embedder, cosine_similarity_matrix
 
 model, cfg = rk.load_pretrained("weights/RWKV-x070-World-0.1B.pth")
+# or a quantized base from rwkv-quant: rk.load_pretrained("model.rwkvq")
 tok = rk.WorldTokenizer()
 
 emb = Embedder(model, tok)                       # terminator=0, pooling="last"
@@ -453,7 +454,7 @@ python tools/run_embedding_curriculum.py \
 
 | Flag | What it does |
 |---|---|
-| `--model` | A `.pth` (official World weights + `WorldTokenizer`) **or** a checkpoint directory (`config.json` + `model.safetensors` + `tokenizer*.json`, with its own BPE tokenizer). Detected by whether the path is a directory. |
+| `--model` | A `.pth` or `.rwkvq` (official World weights + `WorldTokenizer`; `.rwkvq` gives a frozen quantized base, so train the head or LoRA, not the full model) **or** a checkpoint directory (`config.json` + `model.safetensors` + `tokenizer*.json`, with its own BPE tokenizer). Detected by whether the path is a directory. |
 | `--data` | The triplet JSONL. Streamed once. |
 | `--lang` | `any` / `ru` / `en`. Filters rows *before* the reservoir counter, so the sample stays uniform over the kept subset. |
 | `--stages` | Comma-separated subset of `retrieval,sts,classification`, run in the order given. |

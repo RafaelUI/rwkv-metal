@@ -184,17 +184,30 @@ project that calibrates RWKV-7-specific quantization (per-group bit widths,
 outlier handling) instead of quantizing every matrix uniformly, and ships two
 presets tuned by direct perplexity measurement:
 
-| Preset | Size vs bf16 | ppl vs bf16 | Use for |
-|---|---|---|---|
-| `reduction` | 2.35x smaller | +0.12% | QLoRA base — calibrated for near-zero degradation |
-| `compression` | 3.04x smaller | +2.47% | Smaller footprint, small but real quality cost |
+| Preset | Layout | Size vs bf16 | Δppl vs bf16 (held-out text, 0.1B → 2.9B) | Use for |
+|---|---|---|---|---|
+| `reduction` | `sym` (6/8-bit, blocks of 16) | 2.0–2.15x smaller | +0.47% → +0.09% | QLoRA / embedding / reranker base — near-lossless |
+| `compression` | `sb6` (4/5/6-bit, blocks of 32) | 2.8–3.1x smaller | +2.77% → +1.32% | Smaller footprint, small but real quality cost |
+
+Numbers are `rwkv-quant`'s Results table (2026-10, files written by `quantize()`
+with its defaults, GPTQ included); see its README for the method.
 
 `reduction` is the validated default for QLoRA: it's specifically calibrated
 so the base itself contributes negligible error before you even start
-training adapters on top of it. `compression` uses the same code path in
-`rwkv-metal` (the kernel is generic across 4/5/6-bit groups) but hasn't been
-benchmarked end-to-end for QLoRA training the way `reduction` has — treat it
-as untested rather than unsupported if you want to try it.
+training adapters on top of it. `compression` loads and trains through the
+`sb6` path (`native=` below), and both presets' files are covered by the
+loader gates, but training *quality* over many steps on a `compression` base
+has not been measured.
+
+Besides QLoRA, the same file serves inference, embeddings and the reranker:
+`rk.load_pretrained("model.rwkvq")` returns the quantized model without
+adapters (see [`inference.md`](./inference.md#quantized-inference-rwkvq)).
+
+Which layer kind holds each tensor follows the file: `sym` tensors (all of
+`reduction`'s projections, FFN and head) use a dedicated kernel, `sb6` tensors
+(`compression`) use the backend chosen by `native=`, and tensors the file
+stores dense (layer 0's output projection in both presets) a plain frozen dense
+layer.
 
 This is a two-repo pipeline: `rwkv-quant` produces and exports the quantized
 weights (needs torch), `rwkv-metal` trains against them (does not need torch).
@@ -205,7 +218,8 @@ weights (needs torch), `rwkv-metal` trains against them (does not need torch).
 cd rwkv-quant
 python -c "
 from rwkv_quant.api import quantize
-quantize('weights/RWKV-x070-World-1.5B.pth', '/tmp/world15b.rwkvq', preset='reduction')
+quantize('weights/RWKV-x070-World-1.5B.pth', '/tmp/world15b.rwkvq',
+         preset='reduction', tokenizer='rwkv_vocab_v20230424.txt')
 "
 # optional, see below
 python -m rwkv_quant.formats.export_mlx /tmp/world15b.rwkvq /tmp/world15b.rwkvq_mlx
@@ -288,23 +302,32 @@ equivalent entry point if you already have a fully-loaded bf16 model in hand
 
 | `native=` | Mechanism | Measured step time (1.5B, rank 16, top-half layers) | Notes |
 |---|---|---|---|
-| `True` (default) | Repacked into MLX's own `quantized_matmul` | 0.7-0.8s — ties stock QLoRA exactly (same underlying kernel) | MLX's packing rule verified for 4/5/6/8 bits, so both presets work |
-| `False` | Custom fused Metal dequant kernel | 1.2-1.3s | Best memory footprint of the three; bit-width generic (REDUCTION and COMPRESSION both work); doesn't depend on MLX-internal packing details |
+| `True` (default) | Repacked into MLX's own `quantized_matmul` | 0.7-0.8s — ties stock QLoRA exactly (same underlying kernel) | MLX's packing rule verified for 4/5/6/8 bits |
+| `False` | Custom fused Metal dequant kernel | 1.2-1.3s | Best memory footprint of the three; bit-width generic; doesn't depend on MLX-internal packing details |
 | `"hybrid"` | Native code layout + compact scale/bias unpacked on the fly | 0.8-0.9s | Didn't clearly beat the other two in measurement; kept for reference |
 
 If you want the smallest possible memory footprint, use `native=False`. If you
 want QLoRA training speed to exactly match the stock path while still getting
 `rwkv-quant`'s calibrated accuracy, use `native=True`.
 
+`native=` only concerns `sb6` tensors, i.e. the `compression` preset. The step
+times above were measured in July, when `reduction` was still written in `sb6`;
+`reduction` now stores `sym`, which MLX has no native kernel for (blocks of 16),
+so its tensors always take the `sym` kernel whatever `native=` says.
+
 ### Caveats
 
-- **`emb.weight` is never quantized** by this path — embedding lookup is a
-  gather, not `x @ W^T`, so it stays bf16 regardless of preset.
-- **`merge_lora()` doesn't apply here.** It folds the adapter delta into
-  `linear.weight`, but the quantized modules have no dense `.weight` — the
-  base is dequantized on the fly on every call. Keep base + adapter composed
-  at inference time; see [`inference.md`](./inference.md#quantized-inference-rwkvq).
-  There's no built-in "bake the adapter into a new quantized file" step yet.
+- **`emb.weight` is held dense in memory.** The file stores it quantized, but
+  embedding lookup is a gather, not `x @ W^T`, so the loader dequantizes the
+  table once (bf16) regardless of preset.
+- **`merge_lora()` makes the merged projections dense.** A delta cannot be
+  folded into quantized codes without re-quantizing, so each wrapped
+  projection becomes a plain `nn.Linear` holding the dequantized weight plus
+  the adapter (bf16 by default, `merge_lora(model, dtype=...)` otherwise); the
+  layers without adapters stay quantized. That raises memory by the dense size
+  of the wrapped projections. To keep the base small, keep base + adapter
+  composed at inference time. There's no built-in "bake the adapter into a new
+  quantized file" step yet.
 - **The old "`native=` only works at `bits=6`" restriction is gone.** It existed
   because MLX's internal bit packing had only been reverse-engineered at six
   bits. It has since been checked at 4, 5, 6 and 8 and the rule is the same one
@@ -378,7 +401,10 @@ model = merge_lora(model)            # LoRALinear -> nn.Linear with W += scale·
 
 Adapter save/load is exact (bit-identical). `merge_lora` folds the adapter into
 the base weight and replaces `LoRALinear` with a plain `nn.Linear`, so the merged
-model has zero LoRA overhead at inference.
+model has zero LoRA overhead at inference. Over a quantized base (stock QLoRA or
+`.rwkvq`) the merged layer is dense, see the caveat above; before 2026-10-08 it
+added the delta to the packed codes of `nn.QuantizedLinear` and failed on
+`.rwkvq` bases. Gate: `tests/test_rwkvq_downstream.py`.
 
 ---
 
