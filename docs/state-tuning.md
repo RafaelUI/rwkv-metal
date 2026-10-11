@@ -69,8 +69,11 @@ through the full depth: a step costs about as much as adapters on all layers.
 
 - `train=("wkv", "tmix_shift", "cmix_shift")` also trains the shifts.
 - `init=` starts from a given state, e.g. a folded prompt.
-- Learning rate: a state starts from zero and needs a far larger step than
-  weights do; the default follows RWKV-PEFT (1 -> 0.01, cosine).
+- Learning rate: the default (3e-4 -> 3e-5, cosine) is measured, not borrowed.
+  The 1 -> 0.01 schedule usually quoted for state-tuning destroys the model
+  here: g1d 0.1B on Russian prose, 100 steps of 4 x 256, held-out loss 3.228
+  without a state -- 3.374 at lr 1e-2, 3.307 at 3e-3, 3.197 at 1e-3, 3.176 at
+  3e-4. Adam moves every one of the state's numbers by about `lr` per step.
 - Works over a dense base and over `.rwkvq` (`load_rwkvq_model(path, rank=0)`).
 
 For embedding training call `prepare_state_tuning(model.base)` and run
