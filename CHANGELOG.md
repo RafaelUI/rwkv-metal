@@ -4,6 +4,28 @@
 
 ### Added
 
+- **State-tuning and pluggable initial states** (`model/initial_state.py`,
+  `lora/state_tune.py`; `docs/state-tuning.md`). The whole base is frozen and
+  only the initial state is trained -- by default the WKV matrix `[H, S, S]` per
+  layer, as in RWKV-PEFT (0.1B: 0.59 M numbers, 0.4B: 1.57 M, 1.5B: 3.15 M);
+  `train=` adds the token-shift vectors. A trained state and a state folded
+  from a prompt are one object (`RWKVState`, batch 1): `attach_state(model,
+  state)` makes every pass start from it wherever the caller passed no state of
+  its own, so "trained -> system prompt -> cache" is plain continuation
+  (`fold_prompt`). The state of a layer is a parameter of its block
+  (`blocks.N.state0.wkv`), so training runs backward block by block with one
+  block in memory -- LM (`state_tune`) and embedder (`prepare_state_tuning` +
+  `finetune_embedding`), over a dense base and over `.rwkvq`; the gradient is
+  bit-for-bit `nn.value_and_grad` over the whole graph. An attached zero state
+  changes nothing bit-for-bit. The state lives in its own safetensors file
+  (`save_state` / `load_state`) with the architecture contract and a
+  **fingerprint of the base** (`base_fingerprint`: sha256 over the small tensors
+  and one row of two projections, through bf16): a different architecture is
+  always refused, a different base raises `StateBaseMismatch` unless
+  `allow_other_base=True`. A dense model, its `reduction` and its `compression`
+  are three different bases. Gate: `tests/test_state_tuning.py` (21 mutation
+  caps, `--mutations`); `tests/test_embedding_sequential.py` gained the
+  state-and-head cases.
 - **`load_pretrained()` reads `.rwkvq`.** It returns the quantized model with
   no adapters (`lora.load_rwkvq_model(path, rank=0)`), frozen. Inference,
   `Embedder` / `EmbeddingModel`, `Reranker` and the `--model` tools therefore

@@ -105,6 +105,11 @@ from .embedding import (
 
 # ── Reranker (cross-encoder поверх рекуррентного состояния) ─────────────────
 from .model.state import RWKVState, build_mask
+from .model.initial_state import (
+    attach_state, detach_state, attached_state, prepare_state_tuning, fold_prompt,
+    base_fingerprint, save_state, load_state, StateBaseMismatch,
+)
+from .lora.state_tune import StateTuneConfig, state_tune
 from .reranker import (
     Reranker,
     RerankerConfig,
@@ -168,6 +173,9 @@ __all__ = [
     # state
     "RWKVState",
     "build_mask",
+    "attach_state", "detach_state", "attached_state", "prepare_state_tuning",
+    "fold_prompt", "base_fingerprint", "save_state", "load_state",
+    "StateBaseMismatch", "StateTuneConfig", "state_tune",
     # reranker
     "Reranker",
     "RerankerConfig",

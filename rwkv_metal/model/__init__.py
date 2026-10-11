@@ -30,6 +30,10 @@ from .rwkv7 import (
 )
 from .rwkv7_x070 import RWKV7X070, lora_ranks
 from .state import RWKVState, build_mask, gather_last
+from .initial_state import (
+    InitialState, attach_state, detach_state, attached_state, prepare_state_tuning,
+    fold_prompt, base_fingerprint, save_state, load_state, StateBaseMismatch,
+)
 from .convert import load_pretrained, save_converted, load_pth, convert
 from .external import load_local_rwkv7, load_local_tokenizer
 
@@ -48,6 +52,10 @@ __all__ = [
     "RWKVState",
     "build_mask",
     "gather_last",
+    # начальное состояние: state-tuning, свёрнутый промпт, файл
+    "InitialState", "attach_state", "detach_state", "attached_state",
+    "prepare_state_tuning", "fold_prompt", "base_fingerprint", "save_state",
+    "load_state", "StateBaseMismatch",
     "load_pretrained",
     "save_converted",
     "load_pth",

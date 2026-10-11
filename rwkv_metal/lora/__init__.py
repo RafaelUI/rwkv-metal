@@ -31,6 +31,7 @@ from .lora import (
 )
 from .add_rwkvq import add_lora_rwkvq, load_lora_rwkvq_model, load_rwkvq_model
 from .rwkvq_linear import RwkvqLinear
+from .state_tune import StateTuneConfig, state_tune
 from .finetune import (
     LoRAConfig,
     finetune,
@@ -57,4 +58,7 @@ __all__ = [
     "finetune",
     "quantize_base_model",
     "BIG_QUANT_TARGETS",
+    # state-tuning
+    "StateTuneConfig",
+    "state_tune",
 ]

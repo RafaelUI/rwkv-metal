@@ -238,6 +238,19 @@ class RWKVBlock(nn.Module):
         где сдвиги сняты с позиции end_idx (или последней, если end_idx=None) —
         именно они нужны, чтобы продолжение совпало со сплошным проходом.
         """
+        # Подключённое начальное состояние (model/initial_state.py): берётся
+        # только там, где вызывающий своего не передал. [1, ...] транслируется
+        # на батч ЗДЕСЬ, внутри блока, -- vjp блока сам суммирует градиент
+        # состояния по строкам. wkv -- всегда fp32, сдвиги -- в типе потока.
+        s0 = self.get("state0")
+        if s0 is not None:
+            B = x.shape[0]
+            if h_in is None:
+                h_in = mx.broadcast_to(s0.wkv.astype(mx.float32)[None], (B,) + tuple(s0.wkv.shape))
+            if tmix_prev is None:
+                tmix_prev = mx.broadcast_to(s0.tmix_shift.astype(x.dtype), (B, 1, x.shape[-1]))
+            if cmix_prev is None:
+                cmix_prev = mx.broadcast_to(s0.cmix_shift.astype(x.dtype), (B, 1, x.shape[-1]))
         x1 = self.ln1(x)
         if return_state:
             h, v_first, h_out = self.tmix(x1, v_first, x_prev=tmix_prev,
@@ -275,10 +288,13 @@ class RWKV7X070(nn.Module):
         if isinstance(dtype, str):
             dtype = {"bfloat16": mx.bfloat16, "bf16": mx.bfloat16,
                      "float32": mx.float32, "fp32": mx.float32}[dtype]
-        self.update(tree_map(
-            lambda x: x.astype(dtype) if isinstance(x, mx.array) else x,
-            self.parameters(),
-        ))
+        # Матрица WKV подключённого состояния (blocks.N.state0.wkv) остаётся
+        # fp32: рекуррентность считается в fp32, и состояние -- её часть.
+        from mlx.utils import tree_flatten, tree_unflatten
+        self.update(tree_unflatten([
+            (k, v if k.endswith("state0.wkv") else v.astype(dtype))
+            for k, v in tree_flatten(self.parameters())
+        ]))
         mx.eval(self.parameters())
         return self
 

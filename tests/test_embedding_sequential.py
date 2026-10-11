@@ -258,6 +258,32 @@ def main():
     del m
     mx.clear_cache()
 
+    # ── state-tuning: состояние (blocks.N.state0.wkv) и голова, база заморожена ──
+    from rwkv_metal.model.initial_state import prepare_state_tuning, zero_state
+    from rwkv_metal.model.state import RWKVState
+
+    def with_state(base):
+        z = zero_state(base)
+        rs = np.random.RandomState(3)
+        z = RWKVState(wkv=mx.array((rs.normal(size=z.wkv.shape) * 0.05).astype(np.float32)),
+                      tmix_shift=z.tmix_shift, cmix_shift=z.cmix_shift)
+        return prepare_state_tuning(base, init=z)
+    m = dense("head")
+    n_state = with_state(m.base)
+    assert body.first_layer(m.base) == 0 and n_state == 12 * 12 * 64 * 64
+    compare("состояние и голова, одна пачка", m, (idx, pool, w), single_loss, bound=TIGHT, zero=())
+    compare("состояние и голова, retrieval", m, triplet(), tasks.retrieval_loss, bound=TIGHT, zero=())
+    del m
+    mx.clear_cache()
+    q = load_rwkvq_model(RWKVQ, rank=0, verbose=False)[0]
+    m = EmbeddingModel(q)
+    with_state(q)
+    liven(m)
+    compare(".rwkvq, состояние и голова, retrieval", m, triplet(), tasks.retrieval_loss,
+            bound=LATTICE, zero=())
+    del m, q
+    mx.clear_cache()
+
     # ── адаптеры ──
     m = dense("lora")
     compare("LoRA, одна пачка", m, (idx, pool, w), single_loss, bound=0.0, zero=())
