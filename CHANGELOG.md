@@ -20,7 +20,7 @@
   changes nothing bit-for-bit. The state lives in its own safetensors file
   (`save_state` / `load_state`) with the architecture contract and a
   **fingerprint of the base** (`base_fingerprint`: sha256 over the small tensors
-  and one row of two projections, through bf16): a different architecture is
+  and one row of two projections, through bf16; rows of compressed projections through fp16): a different architecture is
   always refused, a different base raises `StateBaseMismatch` unless
   `allow_other_base=True`. A dense model, its `reduction` and its `compression`
   are three different bases. Gate: `tests/test_state_tuning.py` (21 mutation

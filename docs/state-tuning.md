@@ -5,7 +5,7 @@ treats the starting state as a pluggable object — trained (state-tuning), fold
 from a prompt, or one on top of the other — kept in its own small file.
 
 Code: `rwkv_metal/model/initial_state.py`, `rwkv_metal/lora/state_tune.py`.
-Gate: `tests/test_state_tuning.py` (`--mutations` runs its 21 mutation caps).
+Gate: `tests/test_state_tuning.py` (`--mutations` runs its 22 mutation caps).
 
 ## One object
 
@@ -94,7 +94,8 @@ gives a plausible but different result. `load_state(path, model)` therefore
 
 `base_fingerprint(model)` is a sha256 over the contract, the small tensors of
 the base (norms, token-shift mixes, `k_k` / `k_a` / `r_k`) and row 0 of the dense
-weight of two projections (first and last), all cast to bf16. The same base
+weight of two projections (first and last), all cast to bf16 (rows of compressed `.rwkvq`
+projections go through fp16, the lattice they live on). The same base
 loaded as bf16 and as fp32 gives one fingerprint. A dense model, its
 `reduction` file and its `compression` file are three different bases. It is a
 fingerprint of the base, not of adapters on top of it. SwiftRWKV computes the

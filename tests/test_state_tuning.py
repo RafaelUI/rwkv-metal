@@ -62,6 +62,8 @@ MUTATIONS = {
     "fpcanon": (INIT, "a = flat[name].astype(mx.bfloat16).astype(mx.float32).reshape(-1)",
                       "a = flat[name].astype(mx.float32).reshape(-1)"),
     "fprows": (INIT, "    for name in fingerprint_rows(c[\"n_layer\"]):", "    for name in []:"),
+    "fplattice": (INIT, "lattice = mx.bfloat16 if isinstance(mod, nn.Linear) else mx.float16",
+                        "lattice = mx.bfloat16"),
     "fpblocks": (INIT, "    for l in range(n_layer):\n        names +=", "    for l in range(1):\n        names +="),
     "accept": (INIT, 'if meta.get("base_fingerprint") != fp and not allow_other_base:',
                      'if meta.get("base_fingerprint") != fp and allow_other_base:'),
@@ -400,6 +402,12 @@ def main():
     c = load_rwkvq_model(RWKVQ_C, rank=0, verbose=False)[0]
     fc = base_fingerprint(c)
     assert fc not in (fp, fq), "COMPRESSION дал отпечаток другой базы"
+    # те же числа обязан давать SwiftRWKV (StateTuningParityTests): решётка
+    # строк сжатых проекций -- fp16, иначе отпечатки двух библиотек расходятся
+    known = {"0p1b_reduction.rwkvq": "4e56802ad0a0ffaebe7f7ac7955e497a00c5f875dff67cf18ec0e277eebc495e", "0p1b_compression.rwkvq": "8df2516f7b79fb3884d18bf672e74b810de4681d531996e0a9b00ba3c3078117"}
+    for path, got in ((RWKVQ, fq), (RWKVQ_C, fc)):
+        want = known.get(os.path.basename(path))
+        assert want is None or got == want, f"отпечаток {os.path.basename(path)} изменился: {got}"
     del c
     mx.clear_cache()
 

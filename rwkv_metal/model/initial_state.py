@@ -40,8 +40,9 @@ RWKV-PEFT), сдвиги остаются нулями; у состояния п
 
 Отпечаток (`base_fingerprint`) -- sha256 по контракту, малым тензорам базы
 (нормировки, миксы token-shift, k_k / k_a / r_k) и по строке плотного веса
-двух проекций (первой и последней), всё приведено к bf16: одна и та же база,
-загруженная в bf16 и в fp32, даёт один отпечаток. Плотная модель, её
+двух проекций (первой и последней), всё приведено к bf16 (строки сжатых
+проекций .rwkvq -- к fp16, их решётке): одна и та же база, загруженная в bf16
+и в fp32, даёт один отпечаток. Плотная модель, её
 REDUCTION и её COMPRESSION -- ТРИ РАЗНЫЕ базы (малые тензоры у двух пресетов
 общие, их различают проекции). Отпечаток -- базы, а не адаптеров поверх неё.
 Счёт воспроизводится в SwiftRWKV бит в бит, файлы между библиотеками
@@ -224,7 +225,13 @@ def base_fingerprint(model) -> str:
             mod = mod[int(part)] if part.isdigit() else getattr(mod, part)
         if isinstance(mod, LoRALinear):        # отпечаток -- базы, не адаптеров
             mod = mod.linear
-        a = dense_weight(mod, mx.float32)[0].astype(mx.bfloat16).astype(mx.float32).reshape(-1)
+        # Решётка строки -- по роду слоя. Плотный вес идёт через bf16, как малые
+        # тензоры. Деквантованный вес .rwkvq живёт на решётке fp16 (SwiftRWKV
+        # разворачивает его прямо в fp16, здесь он fp32 до округления): через
+        # fp16, иначе два округления подряд разошлись бы с одним.
+        row = dense_weight(mod, mx.float32)[0]
+        lattice = mx.bfloat16 if isinstance(mod, nn.Linear) else mx.float16
+        a = row.astype(lattice).astype(mx.float32).reshape(-1)
         h.update(name.encode() + b"\0")
         h.update(np.asarray(a, dtype="<f4").tobytes())
     return h.hexdigest()
