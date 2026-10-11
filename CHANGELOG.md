@@ -10,6 +10,15 @@
   take a file of either current `rwkv-quant` preset (`reduction` in `sym`,
   `compression` in `sb6`). `load_rwkvq_model(rank=0)` is the same without the
   wrapper.
+- **LoRA / QLoRA training backward block by block** (`lora/sequential.py`,
+  `LoRAConfig.sequential_backward`, on by default; `loss_chunk_tokens = 256`).
+  With `grad_checkpoint` the backward pass is still one lazy graph and MLX picks
+  its evaluation order, so recomputed activations of several blocks are alive at
+  once. Now each block is evaluated before the next; the gradient is bit-for-bit
+  the one `nn.value_and_grad` gives. 1.5B `reduction`, rank 16, batch 1, peak
+  physical footprint: T=2048 7.52 -> 4.17 GB at the same step time (10.3 s);
+  T=4096 fits (5.58 GB, 20.3 s). Models with trainable parameters outside the
+  blocks take the ordinary path. Gate: `tests/test_sequential_backward.py`.
 - `lora.dense_weight()` / `dense_parameters()`: the dense weight of a linear
   layer over any base (`nn.Linear`, `nn.QuantizedLinear`, `LoRALinear`, every
   `.rwkvq` backend), bit-identical to `rwkv_quant.formats.codec`.

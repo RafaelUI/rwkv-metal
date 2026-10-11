@@ -59,6 +59,12 @@ class LoRAConfig:
 
     # ── Memory recipe ─────────────────────────────────────────────────────
     grad_checkpoint:  bool  = True      # nn.utils.checkpoint per block (big RAM + speed win)
+    # Backward block by block, evaluated after each (lora/sequential.py): the
+    # same gradient at the memory of one block. Replaces grad_checkpoint when
+    # every trainable parameter lives in a block (LoRA / QLoRA); other models
+    # take the ordinary path. 1.5B, T=2048: peak 5.4 -> 2.9 GB of MLX memory.
+    sequential_backward: bool = True
+    loss_chunk_tokens:   int  = 256     # head + cross-entropy in pieces (0 = whole)
     cache_limit_gb:   float = 1.5       # mx.set_cache_limit; <=0 disables
 
     # ── Logging / checkpoints ─────────────────────────────────────────────
@@ -139,6 +145,12 @@ def finetune(model, batches: Iterable[Tuple[mx.array, mx.array]], cfg: LoRAConfi
 
     # nn.value_and_grad respects freeze() (only adapters get gradients).
     grad_fn = nn.value_and_grad(model, loss_fn)
+    from . import sequential as _seq
+    if cfg.sequential_backward and _seq.supported(model):
+        model._grad_ckpt = False        # блоки пересчитывает сам обратный проход
+
+        def grad_fn(m, x, y):
+            return _seq.value_and_grad(m, x, y, cfg.loss_chunk_tokens)
 
     it = iter(batches)
 
