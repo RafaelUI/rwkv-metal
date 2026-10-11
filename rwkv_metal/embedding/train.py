@@ -32,6 +32,7 @@ from mlx.utils import tree_flatten, tree_map
 
 from .heads import EmbeddingHead
 from .gradcache import gradcache_value_and_grad
+from . import sequential as _seq
 
 
 def _l2_normalize(x: mx.array) -> mx.array:
@@ -48,7 +49,15 @@ class EmbeddingModel(nn.Module):
         self.head = EmbeddingHead(dim, head_hidden)
 
     def embed(self, idx: mx.array, pool_idx: mx.array) -> mx.array:
-        h = self.base.body(idx)  # [B, T, D]
+        return self._pool(self.base.body(idx), pool_idx)
+
+    def embed_from_top(self, top: mx.array, pool_idx: mx.array) -> mx.array:
+        """Вектор по выходу последнего блока (до ln_out) -- то, что над телом.
+        Нужен обратному проходу по блокам (embedding/sequential.py)."""
+        return self._pool(self.base.ln_out(top), pool_idx)
+
+    def _pool(self, h: mx.array, pool_idx: mx.array) -> mx.array:
+        # h: [B, T, D]
         pooled = mx.take_along_axis(h, pool_idx.reshape(-1, 1, 1), axis=1).squeeze(1)  # [B, D]
         return _l2_normalize(self.head(pooled))
 
@@ -76,6 +85,13 @@ class EmbedTrainConfig:
 
     # ── Memory recipe ─────────────────────────────────────────────────────
     grad_checkpoint: bool = True
+    # Backward block by block, evaluated after each (embedding/sequential.py):
+    # the same gradient with one block of one group alive at a time instead of
+    # every layer of every group. Costs a second forward. Needs a compute_loss
+    # that reaches the model only through model.embed(...) -- every task in
+    # rwkv_metal.embedding.tasks does. Not used under GradCache; with it on,
+    # grad_checkpoint has no effect.
+    sequential_backward: bool = True
     cache_limit_gb: float = 1.5
     gradcache_chunk: int = 0      # >0 + a GradCacheSpec => GradCache; rows per chunk
 
@@ -146,7 +162,11 @@ def finetune_embedding(model: EmbeddingModel, batches: Iterable, cfg: EmbedTrain
     # (mx.value_and_grad would differentiate the whole tree and ignore freeze().)
     eager_grad_fn = nn.value_and_grad(model, loss_fn)
 
+    use_seq = cfg.sequential_backward and not use_gc and _seq.supported(model)
+
     def grad_fn(m, batch):
+        if use_seq:
+            return _seq.value_and_grad(m, batch, compute_loss, cfg.temperature)
         if not use_gc:
             return eager_grad_fn(m, batch)
         chunks = gradcache_spec.split(batch, cfg.gradcache_chunk)

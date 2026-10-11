@@ -19,6 +19,26 @@
   physical footprint: T=2048 7.52 -> 4.17 GB at the same step time (10.3 s);
   T=4096 fits (5.58 GB, 20.3 s). Models with trainable parameters outside the
   blocks take the ordinary path. Gate: `tests/test_sequential_backward.py`.
+- **Embedding training backward block by block** (`embedding/sequential.py`,
+  `EmbedTrainConfig.sequential_backward`, on by default). `nn.value_and_grad`
+  over the whole graph keeps the activations of every layer of every group
+  (anchors, positives, negatives) until the backward pass ends. Now each group
+  runs forward without a gradient, the loss and everything above the body
+  (`ln_out`, pooling, head) is differentiated against the last block's outputs
+  of all groups at once -- the loss still sees the whole batch -- and the blocks
+  go top-down, group by group, each evaluated before the next. Any trainable
+  set: head only, top layers, the whole base (`emb` / `ln0` below the blocks
+  included), LoRA, QLoRA over `.rwkvq`. Any `compute_loss` that reaches the
+  model through `model.embed(...)` only (retrieval, STS, pairs, classification
+  as shipped). Gradient vs `nn.value_and_grad`: bit-for-bit for one group,
+  1.7e-7 for a triplet in fp32, the bf16 lattice where parameters are bf16.
+  0.1B, 8 triplets x 256 tokens, step / peak physical footprint, against
+  `grad_checkpoint`: LoRA rank 16 3.68 s / 1.82 GB (was 3.45 s / 4.20 GB),
+  QLoRA `reduction` 3.69 s / 1.85 GB (was 3.86 s / 4.12 GB), full base
+  4.46 s / 4.37 GB (was 12.6 GB, swapping on a 16 GB machine). Not used under
+  GradCache. Gate: `tests/test_embedding_sequential.py`, 13 mutation checks.
+  The body shared with the LoRA path lives in `lora/sequential.py`
+  (`forward_trace`, `backward_blocks`).
 - `lora.dense_weight()` / `dense_parameters()`: the dense weight of a linear
   layer over any base (`nn.Linear`, `nn.QuantizedLinear`, `LoRALinear`, every
   `.rwkvq` backend), bit-identical to `rwkv_quant.formats.codec`.

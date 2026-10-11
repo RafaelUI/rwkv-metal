@@ -254,7 +254,8 @@ finetune_embedding(model, batcher, cfg, retrieval_loss, gradcache_spec=RETRIEVAL
 
 | Field | Default | What it does |
 |---|---|---|
-| `grad_checkpoint` | `True` | Recompute block activations in backward. Trades ~30% time for a large memory cut. |
+| `sequential_backward` | `True` | Backward block by block, each evaluated before the next (`embedding/sequential.py`): the same gradient with one block of one group (anchors / positives / negatives) alive at a time. Works for head-only, top layers, full base, LoRA and QLoRA. Costs a second forward pass. Needs a `compute_loss` that reaches the model only through `model.embed(...)` — all built-in tasks do. Ignored under GradCache. |
+| `grad_checkpoint` | `True` | Recompute block activations in backward. Trades ~30% time for a large memory cut. No effect while `sequential_backward` is active. |
 | `cache_limit_gb` | `1.5` | MLX allocator cache ceiling. |
 | `gradcache_chunk` | `0` | Rows per GradCache chunk. `0` = eager. Needs a `gradcache_spec` to take effect. |
 
