@@ -81,6 +81,40 @@ For embedding training call `prepare_state_tuning(model.base)` and run
 pooling head, and `embedding/sequential.py` takes it block by block. Save the
 state with `save_state(path, attached_state(model.base), model.base)`.
 
+### What it buys (measured)
+
+Language modelling, Russian prose (held-out windows of 256 tokens, 300 steps of
+4 x 256, lr 3e-4, three seeds; paired bootstrap over windows):
+
+| base | loss without state | with state | change |
+|---|---|---|---|
+| 0.1B dense (g1d) | 3.221 | 3.155 | −0.066 [−0.073; −0.060] |
+| 0.1B `reduction` | 3.224 | 3.157 | −0.066 [−0.073; −0.060] |
+| 0.1B `compression` | 3.251 | 3.179 | −0.072 [−0.078; −0.065] |
+| 0.4B dense (one seed) | 2.946 | 2.893 | −0.053 [−0.061; −0.045] |
+| 0.4B `reduction` (one seed) | 2.947 | 2.891 | −0.056 [−0.064; −0.047] |
+| 0.4B `compression` (one seed) | 2.965 | 2.919 | −0.046 [−0.055; −0.037] |
+
+- A compressed base gains as much as the dense one.
+- **A state moves between bases almost for free.** Trained on one of the three
+  0.1B bases and attached to another (`allow_other_base=True`), it is
+  0.000…0.004 worse than a state trained on the target itself, i.e. keeps
+  94…100% of the gain. The refusal on a different base is therefore stricter
+  than quality requires between a model and its own quantized files; it is
+  kept so that a state is never silently used on an unrelated model.
+- **The learning rate matters more than anything else.** The 1 -> 0.01 schedule
+  often quoted for state-tuning destroys the model here (held-out loss 3.228 ->
+  3.374 at 1e-2 after 100 steps); 3e-4 is the measured default.
+
+**As an embedder, from a language-model checkpoint** (state and pooling head
+trained, 0.1B, 200 steps, MRR over 300 queries with a pool of 600): 0.42…0.74
+on eight runs of nine, comparable to training the top 2 layers (0.46) with 24
+times fewer trainable numbers, well below the top 4 or 6 layers (0.76 / 0.78).
+It is unstable: one run of nine diverged (MRR 0.02, as before training), and
+the useful step size is narrow (state lr 1e-3: 0.63; 3e-4: 0.25; 1e-2 and
+above: nothing learnt). Prefer top-layer training for a new embedder; a state is
+better suited to adapting one that already works.
+
 ## The file
 
 A separate safetensors file: the three tensors in fp32 and metadata —
