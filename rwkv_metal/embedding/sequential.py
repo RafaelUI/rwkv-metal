@@ -27,6 +27,17 @@ temperature)`, обращающийся к модели ТОЛЬКО через 
 что у GradCache: `compute_loss` детерминирован и зовёт `embed` оба раза в
 одном порядке.
 
+Два рычага памяти, не трогающие арифметику (порт SwiftRWKV, 13.10):
+
+- `chunk_tokens` -- строки пачки идут через тело кусками не больше стольких
+  токенов (строк в куске -- chunk_tokens // T, не меньше одной). Строки внутри
+  тела не взаимодействуют, лосс по-прежнему видит весь батч; пик обратного
+  прохода задаёт кусок, а не батч. Градиент тот же с точностью до порядка
+  сложения.
+- `trace_stride` -- входы блоков записываются с шагом, остальные
+  пересчитываются по отрезкам (`lora/sequential.py`, `forward_trace`).
+  Градиент побитно тот же, цена -- до одного прямого прохода.
+
 Порт SwiftRWKV: EmbeddingObjective.sequentialValueAndGrad + SequentialBody.
 """
 import mlx.core as mx
@@ -59,10 +70,12 @@ def supported(model) -> bool:
 class _Stage:
     """Подставная модель для `compute_loss`: наружу -- только `embed`."""
 
-    def __init__(self, model, first):
+    def __init__(self, model, first, chunk_tokens=0, stride=1):
         self._model = model
         self._first = first
-        self.traces = []               # (idx, pool_idx, входы блоков, v_first)
+        self._chunk = chunk_tokens
+        self._stride = stride
+        self.traces = []               # (idx, pool_idx, [(строки, idx куска, входы блоков, v_first)])
         self.tops = []                 # выходы последнего блока, по пачкам
         self._replay = None            # список трассеров выходов тела
         self._at = 0
@@ -72,9 +85,20 @@ class _Stage:
 
     def embed(self, idx, pool_idx):
         model = self._model
-        if self._replay is None:       # запись: прямой проход без градиента
-            top, block_input, v_first = _body.forward_trace(model.base, idx, self._first)
-            self.traces.append((idx, pool_idx, block_input, v_first))
+        if self._replay is None:       # запись: прямой проход без градиента, кусками строк
+            B, T = idx.shape
+            rows = B if not self._chunk or self._chunk <= 0 else max(1, self._chunk // T)
+            pieces, tops = [], []
+            for lo in range(0, B, rows):
+                hi = min(lo + rows, B)
+                part = idx[lo:hi]
+                top, block_input, v_first = _body.forward_trace(model.base, part, self._first,
+                                                                self._stride)
+                pieces.append(((lo, hi), part, block_input, v_first))
+                tops.append(top)
+            top = tops[0] if len(tops) == 1 else mx.concatenate(tops, axis=0)
+            mx.eval(top)
+            self.traces.append((idx, pool_idx, pieces))
             self.tops.append(top)
             return model.embed_from_top(top, pool_idx)
         k = self._at                   # повтор: вектор из готового выхода тела
@@ -94,16 +118,18 @@ class _Stage:
             f"EmbedTrainConfig.sequential_backward.")
 
 
-def value_and_grad(model, batch, compute_loss, temperature: float = 0.05):
+def value_and_grad(model, batch, compute_loss, temperature: float = 0.05,
+                   chunk_tokens: int = 0, trace_stride: int = 1):
     """(лосс, дерево градиентов) -- как
-    `nn.value_and_grad(model, lambda m, b: compute_loss(m, b, temperature))(model, batch)`."""
+    `nn.value_and_grad(model, lambda m, b: compute_loss(m, b, temperature))(model, batch)`.
+    `chunk_tokens` и `trace_stride` -- см. шапку модуля; 0 и 1 -- без них."""
     global CALLS
     CALLS += 1
     base = model.base
     first = _body.first_layer(base)
 
     # ── 1. прямой проход каждой пачки без градиента ──
-    stage = _Stage(model, first)
+    stage = _Stage(model, first, chunk_tokens, trace_stride)
     compute_loss(stage, batch, temperature)
     n = len(stage.traces)
     assert n > 0, "compute_loss ни разу не вызвал model.embed"
@@ -140,8 +166,10 @@ def value_and_grad(model, batch, compute_loss, temperature: float = 0.05):
 
     # ── 3. блоки сверху вниз, пачка за пачкой ──
     body = {}
-    for k, (idx, _, block_input, v_first) in enumerate(stage.traces):
-        _body.backward_blocks(base, block_input, v_first, g[k], body, first, x=idx)
+    for k, (_, _, pieces) in enumerate(stage.traces):
+        for (lo, hi), part, block_input, v_first in pieces:
+            dtop = g[k] if len(pieces) == 1 else g[k][lo:hi]
+            _body.backward_blocks(base, block_input, v_first, dtop, body, first, x=part)
     for name, gk in body.items():
         grads[f"base.{name}"] = gk
 

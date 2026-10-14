@@ -22,6 +22,11 @@
   input   -- котангент по входу не доходит до нижнего блока
   restore -- параметры блока подставляются не свои
   off     -- finetune игнорирует режим
+  strideall -- запись с шагом хранит все входы (память не делится)
+  segv    -- при пересчёте отрезка слои выше нулевого не получают v_first
+             (у слоя 0 переданный v_first ничего не меняет: блок решает по
+             номеру, что v_first рождается в нём, -- такой мутант равносилен)
+  segin   -- пересчитанный отрезок записывает не свои входы
 
     python tests/test_sequential_backward.py
 """
@@ -58,6 +63,9 @@ MUTATIONS = {
     "input": ("need_input = l > first", "need_input = l > first + 1"),
     "restore": ("blk.update(tree_unflatten(list(zip(ks, ins[n_data:]))))",
                 "blk.update(tree_unflatten(list(zip(ks, ins[n_data:][::-1]))))"),
+    "strideall": ("if l >= first and (l - first) % stride == 0:", "if l >= first:"),
+    "segv": ("h, _ = model.blocks[j](h, v_first if j > 0 else None)", "h, _ = model.blocks[j](h, None)"),
+    "segin": ("        block_input[j + 1] = h", "        block_input[j + 1] = block_input[s]"),
 }
 
 
@@ -101,9 +109,9 @@ def reference(model, x, y):
     return loss.item(), dict(tree_flatten(grads))
 
 
-def compare(what, model, x, y, chunk, bound):
+def compare(what, model, x, y, chunk, bound, stride=1):
     loss_ref, g_ref = reference(model, x, y)
-    loss, grads = seq.value_and_grad(model, x, y, chunk)
+    loss, grads = seq.value_and_grad(model, x, y, chunk, trace_stride=stride)
     mx.eval(loss, grads)
     g = dict(tree_flatten(grads))
     assert set(g) == set(g_ref), (what, set(g) ^ set(g_ref))
@@ -141,15 +149,25 @@ def main():
     # 2. куски
     compare("плотная, лосс кусками по 16", m, *batch(2, 48), chunk=16, bound=1e-2)
     compare("плотная, неровные куски по 20", m, *batch(1, 48), chunk=20, bound=1e-2)
+    # запись с шагом: побитно тот же градиент, в том числе отрезок со слоем 0
+    for stride in (2, 3, 5):
+        compare(f"плотная, все слои, запись с шагом {stride}", m, *batch(2, 32), chunk=0, bound=0.0,
+                stride=stride)
+    x2, _ = batch(1, 32)
+    for first, stride, want in ((0, 3, [0, 3, 6, 9]), (9, 2, [9, 11]), (4, 1, list(range(4, 12)))):
+        _, bi, _ = seq.forward_trace(m, x2, first, stride)
+        assert sorted(bi) == want, f"запись с шагом {stride} от {first}: {sorted(bi)} вместо {want}"
     del m
     m = dense(layers=[9, 10, 11])
     compare("плотная, верхние слои", m, *batch(1, 48), chunk=0, bound=0.0)
+    compare("плотная, верхние слои, запись с шагом 2", m, *batch(1, 48), chunk=0, bound=0.0, stride=2)
     del m
     mx.clear_cache()
     # 3. квантованная база
     q = load_rwkvq_model(RWKVQ, rank=4, alpha=8.0, verbose=False, layers=[8, 9, 10, 11])[0]
     liven(q)
     compare(".rwkvq, QLoRA на верхних слоях", q, *batch(1, 32), chunk=16, bound=1e-2)
+    compare(".rwkvq, QLoRA, запись с шагом 3", q, *batch(1, 32), chunk=0, bound=0.0, stride=3)
     del q
     mx.clear_cache()
 

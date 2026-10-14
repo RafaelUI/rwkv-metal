@@ -29,6 +29,8 @@ from mlx.utils import tree_flatten, tree_unflatten
 # Счётчик вызовов: градиент побитно равен автограду, и по числам режим не
 # виден -- тесты смотрят сюда.
 CALLS = 0
+# Прямых проходов с записью (forward_trace) -- для тестов кусков по строкам.
+TRACES = 0
 
 
 def supported(model) -> bool:
@@ -78,21 +80,44 @@ def _add(grads: dict, name: str, gk: mx.array) -> mx.array:
     return gk
 
 
-def forward_trace(model, x: mx.array, first: Optional[int]):
+def forward_trace(model, x: mx.array, first: Optional[int], stride: int = 1):
     """Прямой проход без градиента. Возвращает (выход последнего блока -- до
-    ln_out, входы блоков начиная с `first`, v_first)."""
+    ln_out, входы блоков начиная с `first`, v_first).
+
+    `stride > 1` -- запись с шагом: хранится вход только каждого `stride`-го
+    блока, считая от `first`; остальные `backward_blocks` пересчитывает по
+    отрезкам от ближайшего записанного. Память записи делится на `stride`,
+    цена -- до одного лишнего прямого прохода. Градиент побитно тот же.
+    Порт SwiftRWKV: SequentialBody.forward(stride:)."""
     blocks = model.blocks
     if first is None:
         first = len(blocks)
+    stride = max(1, int(stride))
+    global TRACES
+    TRACES += 1
     h = model.ln0(model.emb(x))
     block_input = {}
     v_first = None
     for l, blk in enumerate(blocks):
-        if l >= first:
+        if l >= first and (l - first) % stride == 0:
             block_input[l] = h
         h, v_first = blk(h, v_first)
         mx.eval(h, v_first)
     return h, block_input, v_first
+
+
+def _restore_input(model, block_input: dict, l: int, first: int, v_first):
+    """Вход блока `l` при записи с шагом: пересчёт отрезка от ближайшего
+    записанного входа ниже. Входы отрезка кладутся в `block_input` -- следующие
+    блоки сверху вниз берут их оттуда же."""
+    if l in block_input:
+        return
+    s = max(j for j in block_input if j < l)
+    h = block_input[s]
+    for j in range(s, l):
+        h, _ = model.blocks[j](h, v_first if j > 0 else None)
+        mx.eval(h)
+        block_input[j + 1] = h
 
 
 def backward_blocks(model, block_input: dict, v_first, dx: mx.array, grads: dict,
@@ -100,7 +125,8 @@ def backward_blocks(model, block_input: dict, v_first, dx: mx.array, grads: dict
     """Блоки сверху вниз от котангента `dx` на выходе последнего блока.
     Градиенты ПРИБАВЛЯЮТСЯ к `grads` (несколько пачек на один шаг); входы
     блоков освобождаются по ходу. `x` (токены) нужен, только если обучается
-    основание -- ln0 / emb."""
+    основание -- ln0 / emb. Записанные с шагом входы (`forward_trace(stride=)`)
+    восстанавливаются здесь же."""
     if first is None:
         return
     blocks = model.blocks
@@ -114,6 +140,7 @@ def backward_blocks(model, block_input: dict, v_first, dx: mx.array, grads: dict
         ks = keys[l]
         current = dict(tree_flatten(blk.trainable_parameters()))
         values = [current[k] for k in ks]
+        _restore_input(model, block_input, l, first, v_first)
         xin = block_input[l]
         has_v = l > 0
         # У нижнего обучаемого блока котангенты по входу никому не нужны: ниже
@@ -179,9 +206,11 @@ def backward_blocks(model, block_input: dict, v_first, dx: mx.array, grads: dict
         mx.eval(ready)
 
 
-def value_and_grad(model, x: mx.array, y: mx.array, loss_chunk: Optional[int] = 256):
+def value_and_grad(model, x: mx.array, y: mx.array, loss_chunk: Optional[int] = 256,
+                   trace_stride: int = 1):
     """(лосс, дерево градиентов) -- как `nn.value_and_grad(model, loss)(model, x, y)`
-    для `model.loss`, обратным проходом по блокам."""
+    для `model.loss`, обратным проходом по блокам. `trace_stride` -- запись
+    входов блоков с шагом (`forward_trace`)."""
     global CALLS
     CALLS += 1
     blocks = model.blocks
@@ -195,7 +224,7 @@ def value_and_grad(model, x: mx.array, y: mx.array, loss_chunk: Optional[int] = 
     first = with_params[0]
 
     # ── 1. прямой проход без градиента: входы обучаемых блоков ──
-    h, block_input, v_first = forward_trace(model, x, first)
+    h, block_input, v_first = forward_trace(model, x, first, trace_stride)
 
     # ── 2. ln_out, голова и лосс: по кускам ──
     hn = model.ln_out(h)

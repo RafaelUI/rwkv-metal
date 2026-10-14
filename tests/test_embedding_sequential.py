@@ -31,6 +31,10 @@
   input   -- котангент по входу не доходит до блока над нижним обучаемым
   off     -- finetune_embedding игнорирует режим
   gc      -- режим перехватывает шаг под GradCache
+  rows    -- куски по строкам не режутся (пачка идёт целиком)
+  slice   -- кусок получает котангент чужих строк
+  part    -- основание получает токены не своего куска
+  cfgpass -- finetune_embedding не передаёт куски и шаг записи
 
     python tests/test_embedding_sequential.py
 """
@@ -64,8 +68,8 @@ MUTATIONS = {
     "sum": ("body", "gk = grads[name] + gk", "gk = gk"),
     "top": ("seq", "model.embed_from_top(self._replay[k], pool_idx)",
             "model.embed_from_top(self._replay[0][:, :self._replay[k].shape[1]], pool_idx)"),
-    "cot": ("seq", "block_input, v_first, g[k], body, first",
-            "block_input, v_first, g[0][:, :g[k].shape[1]], body, first"),
+    "cot": ("seq", "dtop = g[k] if len(pieces) == 1 else g[k][lo:hi]",
+            "dtop = g[0][:, :g[k].shape[1]] if len(pieces) == 1 else g[k][lo:hi]"),
     "above": ("seq", "        put(ins[n:])\n", "        pass\n"),
     "ln_out": ("train", "self._pool(self.base.ln_out(top), pool_idx)", "self._pool(top, pool_idx)"),
     "unused": ("seq", "grads[name] = mx.zeros_like(v)", "grads[name] = mx.ones_like(v)"),
@@ -77,6 +81,10 @@ MUTATIONS = {
     "input": ("body", "need_input = l > first", "need_input = l > first + 1"),
     "off": ("train", "use_seq = cfg.sequential_backward and", "use_seq = False and"),
     "gc": ("train", "use_seq = cfg.sequential_backward and not use_gc and", "use_seq = cfg.sequential_backward and"),
+    "rows": ("seq", "rows = B if not self._chunk or self._chunk <= 0 else max(1, self._chunk // T)", "rows = B"),
+    "slice": ("seq", "dtop = g[k] if len(pieces) == 1 else g[k][lo:hi]", "dtop = g[k] if len(pieces) == 1 else g[k][:hi - lo]"),
+    "part": ("seq", "body, first, x=part)", "body, first, x=pieces[0][1])"),
+    "cfgpass": ("train", "cfg.body_chunk_tokens, cfg.trace_stride)", "0, 1)"),
 }
 ORIG = {"body": body_orig, "seq": seq_orig, "train": train_orig}
 
@@ -154,20 +162,39 @@ def single_loss(model, batch, temperature):
     return (model.embed(idx, pool).astype(mx.float32) * w).sum() / temperature
 
 
-def reference(model, batch, loss):
+class Pieces:
+    """Модель для эталона: `embed` прогоняет строки пачки теми же кусками, что и
+    обратный проход по блокам с `chunk_tokens` (строк в куске -- chunk // T)."""
+
+    def __init__(self, model, chunk):
+        self.model, self.chunk = model, chunk
+
+    def embed(self, idx, pool_idx):
+        B, T = idx.shape
+        rows = max(1, self.chunk // T)
+        if rows >= B:
+            return self.model.embed(idx, pool_idx)
+        return mx.concatenate([self.model.embed(idx[lo:lo + rows], pool_idx[lo:lo + rows])
+                               for lo in range(0, B, rows)], axis=0)
+
+
+def reference(model, batch, loss, chunk=0):
     model.base._grad_ckpt = False
-    value, grads = nn.value_and_grad(model, lambda m, b: loss(m, b, 0.05).astype(mx.float32))(model, batch)
+    wrap = (lambda m: Pieces(m, chunk)) if chunk else (lambda m: m)
+    value, grads = nn.value_and_grad(model, lambda m, b: loss(wrap(m), b, 0.05).astype(mx.float32))(model, batch)
     mx.eval(value, grads)
     return value.item(), dict(tree_flatten(grads))
 
 
-def compare(what, model, batch, loss, bound, zero=("base.head.",)):
+def compare(what, model, batch, loss, bound, zero=("base.head.",), chunk=0, stride=1, pieces=None):
     assert seq.supported(model), what
-    loss_ref, g_ref = reference(model, batch, loss)
-    n = seq.CALLS
-    value, grads = seq.value_and_grad(model, batch, loss, 0.05)
+    loss_ref, g_ref = reference(model, batch, loss, chunk)
+    n, t = seq.CALLS, body.TRACES
+    value, grads = seq.value_and_grad(model, batch, loss, 0.05, chunk, stride)
     mx.eval(value, grads)
     assert seq.CALLS == n + 1
+    if pieces is not None:
+        assert body.TRACES - t == pieces, f"{what}: прямых проходов {body.TRACES - t}, ожидалось {pieces}"
     g = dict(tree_flatten(grads))
     assert set(g) == set(g_ref), (what, sorted(set(g) ^ set(g_ref))[:6])
     worst, live = 0.0, 0
@@ -187,7 +214,7 @@ def compare(what, model, batch, loss, bound, zero=("base.head.",)):
         assert e <= bound, f"{what}: {k} разошёлся на {e:.2e} (допуск {bound:.0e})"
     assert abs(value.item() - loss_ref) <= abs(loss_ref) * 1e-5, (what, value.item(), loss_ref)
     # 6. в модели остались значения: лосс тот же
-    again = loss(model, batch, 0.05).astype(mx.float32).item()
+    again = loss(Pieces(model, chunk) if chunk else model, batch, 0.05).astype(mx.float32).item()
     assert abs(again - loss_ref) <= abs(loss_ref) * 1e-6, (what, again, loss_ref)
     print(f"  {what}: лосс {value.item():.6f} против {loss_ref:.6f}; "
           f"худший градиент {worst:.1e} ({live} параметров)")
@@ -216,6 +243,11 @@ def dense(mode, fp32=True):
 
 TIGHT = float(os.environ.get("SEQ_TIGHT", "2e-5"))     # fp32-счёт, другой порядок сложения пачек
 LATTICE = 2e-2                                        # счёт в bf16: решётка 2^-8 на вклад пачки
+# Куски по строкам: прямой проход модели при другом числе строк не побитно тот
+# же (0.1B fp32: выход тела при батче 3 и по строке -- 8e-7 относительно; .rwkvq
+# в fp16 -- 7e-4, шаг-два решётки), а контрастный лосс с температурой 0.05
+# усиливает это в 20 раз. Поэтому с кусками эталонный автоград тоже прогоняет
+# строки теми же кусками (`Pieces`): прямые проходы совпадают, допуски прежние.
 
 
 def main():
@@ -230,6 +262,25 @@ def main():
     compare("вся база, классификация", m, classification(), tasks.classification_loss, bound=TIGHT)
     idx2, pool2 = group(2, 24, 4)
     compare("вся база, пары", m, (idx, pool, idx2, pool2), tasks.pair_loss, bound=TIGHT)
+    # куски по строкам: триплет B=3, длины 36 / 20 / 28; по 40 токенов -- 1 / 2 / 1
+    # строка в куске, то есть 3 + 2 + 3 прямых прохода; основание учится по своим кускам
+    compare("вся база, retrieval, куски по 40 токенов", m, triplet(), tasks.retrieval_loss, bound=TIGHT,
+            chunk=40, pieces=8)
+    compare("вся база, классификация, куски по 30 токенов", m, classification(),
+            tasks.classification_loss, bound=TIGHT, chunk=30)
+    compare("вся база, retrieval, запись с шагом 3", m, triplet(), tasks.retrieval_loss, bound=TIGHT,
+            stride=3)
+    compare("вся база, retrieval, куски и шаг 2", m, triplet(), tasks.retrieval_loss, bound=TIGHT,
+            chunk=40, stride=2, pieces=8)
+    compare("вся база, retrieval, кусок больше пачки", m, triplet(), tasks.retrieval_loss, bound=TIGHT,
+            chunk=10_000, pieces=3)
+    # запись с шагом -- побитно тот же градиент, что без неё
+    v1, g1 = seq.value_and_grad(m, triplet(), tasks.retrieval_loss, 0.05)
+    v3, g3 = seq.value_and_grad(m, triplet(), tasks.retrieval_loss, 0.05, 0, 3)
+    mx.eval(v1, g1, v3, g3)
+    g1, g3 = dict(tree_flatten(g1)), dict(tree_flatten(g3))
+    assert all(mx.array_equal(g1[k], g3[k]).item() for k in g1), "запись с шагом изменила градиент"
+    print("  запись с шагом 3 -- побитно тот же градиент")
     del m
     mx.clear_cache()
     m = dense("full", fp32=False)
@@ -255,6 +306,8 @@ def main():
     m = dense("top")
     assert body.first_layer(m.base) == 9
     compare("верхние три слоя", m, triplet(), tasks.retrieval_loss, bound=TIGHT, zero=())
+    compare("верхние три слоя, куски и шаг 2", m, triplet(), tasks.retrieval_loss, bound=TIGHT, zero=(),
+            chunk=40, stride=2)
     del m
     mx.clear_cache()
 
@@ -288,27 +341,37 @@ def main():
     m = dense("lora")
     compare("LoRA, одна пачка", m, (idx, pool, w), single_loss, bound=0.0, zero=())
     compare("LoRA, retrieval", m, triplet(), tasks.retrieval_loss, bound=LATTICE, zero=())
+    compare("LoRA, retrieval, куски и шаг 3", m, triplet(), tasks.retrieval_loss, bound=LATTICE, zero=(),
+            chunk=40, stride=3)
     del m
     mx.clear_cache()
     q = load_rwkvq_model(RWKVQ, rank=4, alpha=8.0, verbose=False, layers=[8, 9, 10, 11])[0]
     m = EmbeddingModel(q)
     liven(m)
     compare(".rwkvq, QLoRA на верхних слоях", m, triplet(), tasks.retrieval_loss, bound=LATTICE, zero=())
+    # вкладов в сумму котангента bf16 -- 8 кусков вместо 3 пачек: решётка набегает больше
+    compare(".rwkvq, QLoRA, куски по 40 токенов", m, triplet(), tasks.retrieval_loss, bound=2 * LATTICE,
+            zero=(), chunk=40, pieces=8)
     del m, q
     mx.clear_cache()
 
     # 7. finetune_embedding
-    def run(sequential, chunk=0):
+    def run(sequential, chunk=0, body_chunk=2048, stride=1):
         model = dense("top")
         cfg = train.EmbedTrainConfig(lr=1e-3, max_steps=3, log_every=0, cache_limit_gb=0,
                                      checkpoint_path="/tmp/_emb_seq_test.safetensors")
         assert cfg.sequential_backward is True, "умолчание"
+        assert cfg.body_chunk_tokens == 2048 and cfg.trace_stride == 1, "умолчания кусков и шага"
+        cfg.body_chunk_tokens, cfg.trace_stride = body_chunk, stride
         cfg.sequential_backward = sequential
         cfg.gradcache_chunk = chunk
         n = seq.CALLS
         res = train.finetune_embedding(model, [triplet()], cfg, tasks.retrieval_loss,
                                        gradcache_spec=tasks.RETRIEVAL_GC if chunk else None)
         return res["final_loss"], dict(tree_flatten(model.trainable_parameters())), seq.CALLS - n
+    t = body.TRACES
+    l_ch, p_ch, _ = run(True, body_chunk=40, stride=2)
+    assert body.TRACES - t == 3 * 8, f"finetune_embedding не передал куски: {body.TRACES - t} проходов за 3 шага"
     l_seq, p_seq, n_seq = run(True)
     l_ref, p_ref, n_ref = run(False)
     _, _, n_gc = run(True, chunk=2)
@@ -322,6 +385,12 @@ def main():
     # (градиенты сверены выше вплотную; здесь -- что путь тот и обучение то же).
     assert abs(l_seq - l_ref) <= abs(l_ref) * 1e-3 and worst <= 5e-3, (l_seq, l_ref, worst)
     print(f"  finetune_embedding: лосс {l_seq:.6f} против {l_ref:.6f}, параметры после 3 шагов {worst:.1e}")
+    # Параметры с кусками и без не сравниваются вплотную: прямой проход по строке и
+    # по пачке различается в последних битах, а Adam на почти нулевых компонентах
+    # делает шаг порядка lr. Градиент кусков сверен с эталоном выше; здесь -- что
+    # настройка дошла до прохода (счётчик) и обучение идёт тем же курсом.
+    assert abs(l_ch - l_seq) <= abs(l_seq) * 1e-2, (l_ch, l_seq)
+    print(f"  finetune_embedding с кусками и шагом записи: лосс {l_ch:.6f} против {l_seq:.6f}")
     print("ГЕЙТ ПРОЙДЕН")
 
 

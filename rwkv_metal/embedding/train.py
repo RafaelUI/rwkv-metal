@@ -92,6 +92,15 @@ class EmbedTrainConfig:
     # rwkv_metal.embedding.tasks does. Not used under GradCache; with it on,
     # grad_checkpoint has no effect.
     sequential_backward: bool = True
+    # Under sequential_backward: rows of a group go through the body in pieces of
+    # at most this many tokens (rows per piece = body_chunk_tokens // T, at least
+    # one); the loss still sees the whole batch. 0 -- the whole group at once.
+    # 2048 as in SwiftRWKV: per-token cost stops falling by ~1024 tokens per pass.
+    body_chunk_tokens: int = 2048
+    # Under sequential_backward: keep the input of every N-th block only and
+    # recompute the rest segment by segment. Bit-identical gradient; costs up to
+    # one more forward pass.
+    trace_stride: int = 1
     cache_limit_gb: float = 1.5
     gradcache_chunk: int = 0      # >0 + a GradCacheSpec => GradCache; rows per chunk
 
@@ -166,7 +175,8 @@ def finetune_embedding(model: EmbeddingModel, batches: Iterable, cfg: EmbedTrain
 
     def grad_fn(m, batch):
         if use_seq:
-            return _seq.value_and_grad(m, batch, compute_loss, cfg.temperature)
+            return _seq.value_and_grad(m, batch, compute_loss, cfg.temperature,
+                                       cfg.body_chunk_tokens, cfg.trace_stride)
         if not use_gc:
             return eager_grad_fn(m, batch)
         chunks = gradcache_spec.split(batch, cfg.gradcache_chunk)
