@@ -32,6 +32,7 @@ from .lora import (
 from .add_rwkvq import add_lora_rwkvq, load_lora_rwkvq_model, load_rwkvq_model
 from .rwkvq_linear import RwkvqLinear
 from .state_tune import StateTuneConfig, state_tune
+from .top_layers import unpack_top_layers, prepare_top_layers
 from .finetune import (
     LoRAConfig,
     finetune,
@@ -58,6 +59,9 @@ __all__ = [
     "finetune",
     "quantize_base_model",
     "BIG_QUANT_TARGETS",
+    # верхние слои над сжатой базой
+    "unpack_top_layers",
+    "prepare_top_layers",
     # state-tuning
     "StateTuneConfig",
     "state_tune",
