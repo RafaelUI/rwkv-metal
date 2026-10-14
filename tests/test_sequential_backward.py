@@ -27,6 +27,7 @@
              (у слоя 0 переданный v_first ничего не меняет: блок решает по
              номеру, что v_first рождается в нём, -- такой мутант равносилен)
   segin   -- пересчитанный отрезок записывает не свои входы
+  budget  -- кусок лосса снова на строку, а не на батч
 
     python tests/test_sequential_backward.py
 """
@@ -66,6 +67,7 @@ MUTATIONS = {
     "strideall": ("if l >= first and (l - first) % stride == 0:", "if l >= first:"),
     "segv": ("h, _ = model.blocks[j](h, v_first if j > 0 else None)", "h, _ = model.blocks[j](h, None)"),
     "segin": ("        block_input[j + 1] = h", "        block_input[j + 1] = block_input[s]"),
+    "budget": ("return max(1, loss_chunk // max(1, batch))", "return loss_chunk"),
 }
 
 
@@ -157,6 +159,12 @@ def main():
     for first, stride, want in ((0, 3, [0, 3, 6, 9]), (9, 2, [9, 11]), (4, 1, list(range(4, 12)))):
         _, bi, _ = seq.forward_trace(m, x2, first, stride)
         assert sorted(bi) == want, f"запись с шагом {stride} от {first}: {sorted(bi)} вместо {want}"
+    # кусок лосса -- бюджет позиций на весь батч
+    for args, want in (((256, 8, 512), 32), ((256, 1, 512), 256), ((16, 2, 48), 8), ((0, 4, 48), 48),
+                       ((3, 8, 48), 1), ((None, 2, 40), 40)):
+        got = seq.loss_piece_positions(*args)
+        assert got == want, f"loss_piece_positions{args} = {got}, ожидалось {want}"
+    compare("плотная, бюджет лосса 32 на батч 4", m, *batch(4, 32), chunk=32, bound=1e-2)
     del m
     m = dense(layers=[9, 10, 11])
     compare("плотная, верхние слои", m, *batch(1, 48), chunk=0, bound=0.0)

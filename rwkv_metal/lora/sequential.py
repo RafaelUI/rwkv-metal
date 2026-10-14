@@ -206,10 +206,22 @@ def backward_blocks(model, block_input: dict, v_first, dx: mx.array, grads: dict
         mx.eval(ready)
 
 
+def loss_piece_positions(loss_chunk: Optional[int], batch: int, length: int) -> int:
+    """Сколько позиций по длине в одном куске головы. `loss_chunk` -- бюджет
+    позиций на ВЕСЬ батч: кусок логитов -- [B · позиции, V] в fp32, и пока кусок
+    считался на строку, пик шага при батче держала голова (SwiftRWKV, 0.1B,
+    8 × 512: 3.06 ГБ при куске 256 на строку против 2.04 ГБ при 32). Батч 1 --
+    как раньше. Порт SwiftRWKV: LoRAFinetune.lossPieceTokens."""
+    if not loss_chunk or loss_chunk <= 0:
+        return length
+    return max(1, loss_chunk // max(1, batch))
+
+
 def value_and_grad(model, x: mx.array, y: mx.array, loss_chunk: Optional[int] = 256,
                    trace_stride: int = 1):
     """(лосс, дерево градиентов) -- как `nn.value_and_grad(model, loss)(model, x, y)`
-    для `model.loss`, обратным проходом по блокам. `trace_stride` -- запись
+    для `model.loss`, обратным проходом по блокам. `loss_chunk` -- позиций
+    головы на весь батч за раз (`loss_piece_positions`); `trace_stride` -- запись
     входов блоков с шагом (`forward_trace`)."""
     global CALLS
     CALLS += 1
@@ -230,7 +242,7 @@ def value_and_grad(model, x: mx.array, y: mx.array, loss_chunk: Optional[int] = 
     hn = model.ln_out(h)
     mx.eval(hn)
     scale = mx.array(1.0 / (B * T), dtype=mx.float32)
-    step = loss_chunk if loss_chunk and loss_chunk > 0 else T
+    step = loss_piece_positions(loss_chunk, B, T)
     total = mx.array(0.0, dtype=mx.float32)
     pieces = []
     for lo in range(0, T, step):
