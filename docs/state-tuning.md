@@ -91,15 +91,15 @@ Language modelling, Russian prose (held-out windows of 256 tokens, 300 steps of
 | 0.1B dense (g1d) | 3.221 | 3.155 | −0.066 [−0.073; −0.060] |
 | 0.1B `reduction` | 3.224 | 3.157 | −0.066 [−0.073; −0.060] |
 | 0.1B `compression` | 3.251 | 3.179 | −0.072 [−0.078; −0.065] |
-| 0.4B dense (one seed) | 2.946 | 2.893 | −0.053 [−0.061; −0.045] |
-| 0.4B `reduction` (one seed) | 2.947 | 2.891 | −0.056 [−0.064; −0.047] |
-| 0.4B `compression` (one seed) | 2.965 | 2.919 | −0.046 [−0.055; −0.037] |
+| 0.4B dense | 2.946 | 2.895 | −0.051 [−0.059; −0.043] |
+| 0.4B `reduction` | 2.947 | 2.897 | −0.050 [−0.058; −0.042] |
+| 0.4B `compression` | 2.965 | 2.925 | −0.040 [−0.056; −0.016] |
 
 - A compressed base gains as much as the dense one.
 - **A state moves between bases almost for free.** Trained on one of the three
   0.1B bases and attached to another (`allow_other_base=True`), it is
   0.000…0.004 worse than a state trained on the target itself, i.e. keeps
-  94…100% of the gain. The refusal on a different base is therefore stricter
+  94…100% of the gain (0.4B: −0.008…+0.012). The refusal on a different base is therefore stricter
   than quality requires between a model and its own quantized files; it is
   kept so that a state is never silently used on an unrelated model.
 - **The learning rate matters more than anything else.** The 1 -> 0.01 schedule
@@ -114,6 +114,25 @@ It is unstable: one run of nine diverged (MRR 0.02, as before training), and
 the useful step size is narrow (state lr 1e-3: 0.63; 3e-4: 0.25; 1e-2 and
 above: nothing learnt). Prefer top-layer training for a new embedder; a state is
 better suited to adapting one that already works.
+
+**In place of the instruction line**, on top of a trained embedder (0.1B, top 4
+layers trained with `Instruct: … Query: …` queries; then the instruction — 17.8
+tokens per query — is removed and only the state is trained, lr 1e-4; control:
+the same steps training the head instead; three seeds, paired bootstrap):
+
+| base | with instruction | without | without + state | without + head (control) | state − with instruction |
+|---|---|---|---|---|---|
+| dense | 0.759 | 0.752 | 0.758 | 0.754 | −0.001 [−0.012; +0.010] |
+| `reduction` | 0.757 | 0.748 | 0.756 | 0.750 | −0.000 [−0.012; +0.011] |
+
+The state brings quality back to the level with the instruction while every
+query gets 17.8 tokens shorter. The loss from dropping the instruction was small
+to begin with (−0.007…−0.009): this data has one instruction for all queries,
+and the embedder barely relies on it. The state beats the control by
++0.004…+0.007, at the edge of significance. The state was attached to the
+model, so it applied to documents too, not only to queries. With several or
+long instructions the gain may be larger; neither that nor a query-only state
+was measured.
 
 ## The file
 
