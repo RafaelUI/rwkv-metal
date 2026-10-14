@@ -30,15 +30,50 @@ import mlx.core as mx
 from .dataset import encode_batch, parse_classification_candidates
 
 
+# Токенов на пачку оценки (строки × длина самой длинной) -- порт SwiftRWKV
+# `EmbeddingMetrics.evaluationBatchTokens`.
+EVALUATION_BATCH_TOKENS = 4096
+
+# Пачек оценки, прошедших тело по блокам (для тестов).
+BATCHES = 0
+
+
 def _embed_texts(model, tokenizer, texts: Sequence[str], batch_size: int = 16,
-                  terminator: int = 0) -> mx.array:
-    """Encode a flat list of texts to L2-normalized [N, D] vectors, batched
-    (right-padded per micro-batch, same convention as training)."""
+                  terminator: int = 0, batch_tokens: Optional[int] = None) -> mx.array:
+    """Encode a flat list of texts to L2-normalized [N, D] vectors.
+
+    A batch is filled by rows (`batch_size`) AND by tokens (`batch_tokens`,
+    rows × longest row; default `EVALUATION_BATCH_TOKENS`, 0 -- rows only), and
+    the body runs block by block, evaluated after each block: the same operations
+    as `model.embed`, but one lazy graph over the whole body held every layer's
+    activations at once. Port of SwiftRWKV `EmbeddingMetrics.embedAll`
+    (32 rows of 1024 tokens, peak MLX: 0.1B 1.85 -> 0.84 GB). Models without
+    `base` / `embed_from_top` (anything not an `EmbeddingModel`) go through
+    `model.embed` as before."""
+    global BATCHES
+    from ..lora.sequential import forward_trace
+    budget = EVALUATION_BATCH_TOKENS if batch_tokens is None else batch_tokens
+    by_blocks = hasattr(model, "embed_from_top") and hasattr(model, "base")
+    lengths = [len(tokenizer.encode(t)) + 1 for t in texts]
     vecs = []
-    for i in range(0, len(texts), batch_size):
-        chunk = texts[i:i + batch_size]
-        idx, pool = encode_batch(tokenizer, chunk, terminator)
-        vecs.append(model.embed(idx, pool))
+    i = 0
+    while i < len(texts):
+        end, longest = i + 1, lengths[i]
+        while end < len(texts) and end - i < batch_size:
+            grown = max(longest, lengths[end])
+            if budget and budget > 0 and (end - i + 1) * grown > budget:
+                break
+            longest, end = grown, end + 1
+        idx, pool = encode_batch(tokenizer, texts[i:end], terminator)
+        if by_blocks:
+            top, _, _ = forward_trace(model.base, idx, None)
+            v = model.embed_from_top(top, pool)
+            BATCHES += 1
+        else:
+            v = model.embed(idx, pool)
+        mx.eval(v)                      # иначе ленивый граф удержит активации
+        vecs.append(v)
+        i = end
     out = mx.concatenate(vecs, axis=0)
     mx.eval(out)
     return out
