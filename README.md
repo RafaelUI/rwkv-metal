@@ -10,7 +10,13 @@ hand-written Metal kernel with a checkpointed backward pass, so training is
 fast and fits in unified memory.
 
 - Train RWKV-7 **from scratch** with a simple config.
-- **LoRA / QLoRA** fine-tune your own checkpoints or official RWKV-7 World weights.
+- **LoRA / QLoRA** fine-tune your own checkpoints or official RWKV-7 World weights,
+  also over a quantized `.rwkvq` base.
+- **Top-layer training** over a quantized `.rwkvq` base: the top N layers are
+  unpacked to dense fp32 weights, the bottom stays compressed.
+- **State-tuning**: the base frozen, only the initial state of the recurrence
+  trained (0.1B: 0.59 M numbers), kept in its own file with a fingerprint of the
+  base; a trained state and a folded prompt are one pluggable object.
 - **Text embeddings**: pooled sentence vectors, contrastive fine-tuning, GradCache.
 - **Reranking**: a cross-encoder that scores query–document pairs off the
   recurrent state, with a cacheable document prefix.
@@ -140,6 +146,28 @@ its own tokens (73 ms → 3.5 ms per pair on a 0.1B base). Training the head run
 on cached states, which makes an epoch over tens of thousands of pairs take
 seconds. See **[docs/reranker.md](docs/reranker.md)**.
 
+### State-tuning
+
+The base stays frozen and only the initial state is trained — by default the
+WKV matrix of every layer. On Russian prose it lowers held-out loss by 0.066 on
+0.1B and by ~0.05 on 0.4B, the same over a dense base and over its `.rwkvq`
+files, and a state moves between a model and its quantized files keeping
+94–100% of the gain.
+
+```python
+from rwkv_metal import attach_state, load_state
+from rwkv_metal.lora import StateTuneConfig, state_tune
+
+state_tune(model, batches, StateTuneConfig(max_steps=500, state_path="task.state.safetensors"))
+
+state, meta = load_state("task.state.safetensors", model)   # refuses a different base
+attach_state(model, state)                                  # every pass starts from it
+```
+
+See **[docs/state-tuning.md](docs/state-tuning.md)** — attaching and prompt
+caches, the file and the fingerprint, the learning rate (the often-quoted
+1 -> 0.01 destroys the model; 3e-4 is measured), embeddings, cost.
+
 ---
 
 ## What's inside
@@ -149,9 +177,12 @@ rwkv_metal/
 ├── kernel/       Metal WKV-7 kernel: forward, checkpointed backward, inference,
 │                 stateful variants + a pure-Python reference for correctness
 ├── model/        RWKV7 (from-scratch) and RWKV7X070 (official x070 weights),
-│                 RWKVState + torch-free .pth loader / converter
+│                 RWKVState, pluggable initial states and state files,
+│                 torch-free .pth loader / converter
 ├── pretrain/     PretrainConfig, presets, dataset loaders, training loop, CLI
-├── lora/         LoRA/QLoRA engine, high-level finetune(), QLoRA helpers
+├── lora/         LoRA/QLoRA engine, high-level finetune(), QLoRA helpers,
+│                 .rwkvq bases, top-layer training, state-tuning,
+│                 backward block by block
 ├── embedding/    pooling head, contrastive losses, curriculum trainer, GradCache
 ├── reranker/     cross-encoder head over the state, state cache, inference API
 └── tokenizer/    RWKV World tokenizer (65536-token vocab)
