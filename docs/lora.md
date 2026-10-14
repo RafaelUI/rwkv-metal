@@ -472,6 +472,8 @@ In order of impact for large-model LoRA on 16 GB:
 | Fewer trainable layers | `add_lora(layers=range(12, 24))` | smaller backward, big speedup |
 | Cache limit | `LoRAConfig(cache_limit_gb=1.5)` | stops swap under free RAM |
 | Effective batch | `LoRAConfig(grad_accum=N)` | large batch without large activations |
+| Head in pieces | `LoRAConfig(loss_chunk_tokens=256)` | logits held for 256 positions of the **whole batch** at a time (`[256, 65536]` fp32), not per row |
+| Block inputs with a stride | `lora.sequential.value_and_grad(..., trace_stride=2)` | under the block-by-block backward keeps every 2nd block input and recomputes the rest; bit-identical gradient, up to one more forward |
 
 The remaining "floor" (forward + the cross-entropy over a 65536 vocab) does not
 depend on the backward pass. Lowering it further would require a Metal-kernel

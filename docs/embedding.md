@@ -255,6 +255,8 @@ finetune_embedding(model, batcher, cfg, retrieval_loss, gradcache_spec=RETRIEVAL
 | Field | Default | What it does |
 |---|---|---|
 | `sequential_backward` | `True` | Backward block by block, each evaluated before the next (`embedding/sequential.py`): the same gradient with one block of one group (anchors / positives / negatives) alive at a time. Works for head-only, top layers, full base, LoRA and QLoRA. Costs a second forward pass. Needs a `compute_loss` that reaches the model only through `model.embed(...)` — all built-in tasks do. Ignored under GradCache. |
+| `body_chunk_tokens` | `2048` | Under `sequential_backward`: rows of a group go through the body in pieces of at most this many tokens (rows per piece = `body_chunk_tokens // T`, at least one); the loss still sees the whole batch. The backward peak is then set by the piece, not the batch. `0` — the whole group at once. Same gradient up to the batch-size dependence of the forward pass itself (last bits). |
+| `trace_stride` | `1` | Under `sequential_backward`: keep the input of every N-th block only and recompute the others segment by segment. Bit-identical gradient; costs up to one more forward pass. |
 | `grad_checkpoint` | `True` | Recompute block activations in backward. Trades ~30% time for a large memory cut. No effect while `sequential_backward` is active. |
 | `cache_limit_gb` | `1.5` | MLX allocator cache ceiling. |
 | `gradcache_chunk` | `0` | Rows per GradCache chunk. `0` = eager. Needs a `gradcache_spec` to take effect. |
@@ -266,6 +268,30 @@ finetune_embedding(model, batcher, cfg, retrieval_loss, gradcache_spec=RETRIEVAL
 | `log_every` | `10` | Step-log interval. |
 | `save_every` | `0` | Checkpoint interval; `0` = only at the end. Worth setting for multi-hour runs — a run killed mid-stage otherwise leaves nothing. |
 | `checkpoint_path` | `"embedding_model.safetensors"` | Destination. |
+
+### Training top layers over a quantized base
+
+`prepare_top_layers(base, n)` (`rwkv_metal.lora`) unpacks the projections of the
+top `n` blocks of a `.rwkvq` base into dense `nn.Linear` weights, casts those
+blocks to fp32, freezes everything else and leaves the `n` blocks and `ln_out`
+trainable; the bottom stays compressed and runs on its own kernels. fp32 matches
+SwiftRWKV, whose trainable weights are fp32 masters: an Adam step of ~2e-5 on a
+weight of ~0.05 is below the fp16 lattice and would be lost.
+
+```python
+base = load_rwkvq_model("0p4b_reduction.rwkvq", rank=0)[0]
+prepare_top_layers(base, 4)
+model = EmbeddingModel(base)          # the pooling head is trainable too
+finetune_embedding(model, batches, EmbedTrainConfig(), tasks.retrieval_loss)
+```
+
+### Evaluation
+
+The held-out evaluation (`rwkv_metal.embedding.eval`) fills a batch by rows and
+by tokens (`EVALUATION_BATCH_TOKENS`, 4096: rows × longest row) and runs the
+body block by block, evaluated after each — the same operations as
+`model.embed`, bit for bit, without one lazy graph holding every layer's
+activations.
 
 `save_embedding_model` writes **trainable parameters only**: the whole model
 under full-FT, just adapters and head under LoRA. Load it back with

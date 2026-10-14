@@ -4,6 +4,26 @@
 
 ### Added
 
+- **Training the top layers over a quantized base** (`lora/top_layers.py`):
+  `prepare_top_layers(base, n)` unpacks the projections of the top `n` blocks of
+  a `.rwkvq` base into dense fp32 `nn.Linear`, freezes the rest and trains those
+  blocks and `ln_out`; the bottom stays compressed. Port of SwiftRWKV
+  `.topLayers(N)`. Gate: `tests/test_top_layers.py` (9 mutation caps).
+- **Memory levers of the block-by-block backward, ported from SwiftRWKV**:
+  `EmbedTrainConfig.body_chunk_tokens` (2048 — rows of a group go through the
+  body in pieces) and `trace_stride` (keep every N-th block input, recompute the
+  rest; bit-identical gradient); `lora.sequential.value_and_grad(trace_stride=)`.
+- **Held-out embedding evaluation by blocks**: batches filled by rows and by
+  tokens (`EVALUATION_BATCH_TOKENS`, 4096), body evaluated block by block — bit
+  for bit `model.embed`, without one lazy graph over all layers.
+
+### Changed
+
+- **`loss_chunk_tokens` is a budget for the whole batch**, not per row
+  (`LoRAConfig`, `StateTuneConfig`): a head piece is `[B · positions, V]` in
+  fp32, and per-row pieces let the head hold the step's peak as the batch grew.
+  The numbers change only in summation order.
+
 - **State-tuning and pluggable initial states** (`model/initial_state.py`,
   `lora/state_tune.py`; `docs/state-tuning.md`). The whole base is frozen and
   only the initial state is trained -- by default the WKV matrix `[H, S, S]` per
