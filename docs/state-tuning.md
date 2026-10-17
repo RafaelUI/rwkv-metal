@@ -132,8 +132,14 @@ to begin with (−0.007…−0.009): this data has one instruction for all queri
 and the embedder barely relies on it. The state beats the control by
 +0.004…+0.007, at the edge of significance. The state was attached to the
 model, so it applied to documents too, not only to queries. With several or
-long instructions the gain may be larger; neither that nor a query-only state
-was measured.
+long instructions the gain may be larger; that was not measured.
+
+A query-only state was measured in SwiftRWKV (`EmbeddingModel.stateScope =
+.queriesOnly`, documents embedded exactly as with no state), `reduction`, three
+seeds: 0.752 against 0.756 for the all-texts state and 0.750 for the control —
+queries only − all texts −0.004 [−0.010; +0.002], queries only − control +0.003
+[−0.004; +0.010]. Restricting the state to queries does not help on this data.
+rwkv-metal has no per-text switch of the attached state.
 
 ### Cost of a step
 
@@ -183,7 +189,7 @@ same value, so files move between the two libraries.
 
 ## Not done
 
-- A state attached to queries only, the way an instruction is used, needs the
-  attached state switched per text; not measured.
+- No per-text switch of the attached state (a query-only state, as in
+  SwiftRWKV's `stateScope`); measured there, it did not help on this data.
 - Instructions that differ per query — where a state could gain more than on
   the single-instruction data above — were not measured.
