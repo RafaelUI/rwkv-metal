@@ -39,6 +39,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import mlx.core as mx
 import numpy as np
 
+from ..model.initial_state import (NO_INITIAL_STATE,
+                                   initial_state_fingerprint)
 from ..model.state import RWKVState, build_mask
 from .data import PairTemplate, RerankSample
 
@@ -72,6 +74,12 @@ class StateCache:
     states: np.ndarray
     pair_index: np.ndarray
     labels: np.ndarray
+    # Отпечаток начального состояния, подключённого к базе при сборке
+    # (`initial_state.state_fingerprint`; `none` -- без состояния). Состояния
+    # пар -- функция и его: кэш, снятый с одним состоянием, при другом даёт
+    # правдоподобные и неверные числа. Кэш, записанный до появления поля,
+    # читается как `none`.
+    initial_state: str = NO_INITIAL_STATE
 
     def __post_init__(self):
         # приходящие mx.array (старые вызовы, тесты) приводим к numpy
@@ -121,7 +129,8 @@ class StateCache:
         else:
             np.save(target, self.states)
         np.savez(base + ".idx.npz", pair_index=self.pair_index,
-                 labels=self.labels)
+                 labels=self.labels,
+                 initial_state=np.array(self.initial_state))
 
     @staticmethod
     def load(path: str, mmap: bool = True) -> "StateCache":
@@ -131,7 +140,20 @@ class StateCache:
         base = path[:-4] if path.endswith(".npy") else path
         states = np.load(base + ".npy", mmap_mode="r" if mmap else None)
         idx = np.load(base + ".idx.npz")
-        return StateCache(states, idx["pair_index"], idx["labels"])
+        state = (str(idx["initial_state"]) if "initial_state" in idx.files
+                 else NO_INITIAL_STATE)
+        return StateCache(states, idx["pair_index"], idx["labels"],
+                          initial_state=state)
+
+    def check_initial_state(self, model):
+        """Отказ, если к модели подключено не то состояние, с которым собран
+        кэш (`model` -- база или реранкер)."""
+        now = initial_state_fingerprint(getattr(model, "base", model))
+        if self.initial_state != now:
+            raise ValueError(
+                f"кэш собран с начальным состоянием {self.initial_state}, "
+                f"у модели сейчас {now}: состояния пар -- функция и его, "
+                "числа были бы правдоподобными и неверными; пересобери кэш")
 
 
 def _encode_prefix_ids(tokenizer, template: PairTemplate, instruct: str,
@@ -316,6 +338,7 @@ def encode_pairs(reranker, tokenizer, pool: Sequence[str],
         states=out_np,
         pair_index=pair_index,
         labels=np.array([s.label for s in samples], dtype=np.int32),
+        initial_state=initial_state_fingerprint(reranker.base),
     )
     if out_path:
         cache.save(out_path)          # состояния уже на диске, пишутся индексы

@@ -53,13 +53,13 @@ def slice_cache(cache, cache_sources, wanted):
     else:
         states = cache.states[:, pos]
     return StateCache(states=states, pair_index=cache.pair_index,
-                      labels=cache.labels)
+                      labels=cache.labels, initial_state=cache.initial_state)
 
 
 def subset(cache, rows):
     a = np.asarray(rows, dtype=np.int32)
     return StateCache(states=cache.states, pair_index=cache.pair_index[a],
-                      labels=cache.labels[a])
+                      labels=cache.labels[a], initial_state=cache.initial_state)
 
 
 def main():

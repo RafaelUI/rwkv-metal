@@ -237,6 +237,50 @@ def base_fingerprint(model) -> str:
     return h.hexdigest()
 
 
+# ── Отпечаток самого состояния ──────────────────────────────────────────
+#
+# Нужен контрактам кэшей, которые хранят результат счёта, а не текст (индекс
+# префиксов реранкера, кэш состояний пар): свёрнутый префикс -- функция ровно
+# (база, подключённое состояние, текст). Тот же отпечаток бит в бит -- в
+# SwiftRWKV (`StateFile.stateFingerprint`).
+
+CONTRACT_KEY = "initial_state"
+# «Состояния нет». Им же читается ОТСУТСТВИЕ ключа в кэше, записанном до его
+# появления: такой кэш считается снятым без состояния. Кэш, снятый с
+# состоянием до этой правки, от него не отличить -- слепая зона, её закрывает
+# пересборка.
+NO_INITIAL_STATE = "none"
+
+
+def state_fingerprint(state: Optional[RWKVState]) -> str:
+    """`none` либо `sha256:<hex>`.
+
+    sha256 по заголовку `rwkv-initial-state-v1` и трём тензорам в порядке wkv,
+    tmix_shift, cmix_shift; у каждого -- имя, нулевой байт, форма через запятую,
+    перевод строки и значения в fp32 (little-endian, по строкам). None и
+    НУЛЕВОЕ состояние -- одно значение `none`: подключённые нули счёта не
+    меняют, и кэш, снятый без состояния, для них верен.
+    """
+    if state is None:
+        return NO_INITIAL_STATE
+    parts = [("wkv", state.wkv), ("tmix_shift", state.tmix_shift),
+             ("cmix_shift", state.cmix_shift)]
+    arrs = [(n, np.ascontiguousarray(np.asarray(a.astype(mx.float32)), dtype="<f4"))
+            for n, a in parts]
+    if all(not a.any() for _, a in arrs):
+        return NO_INITIAL_STATE
+    h = hashlib.sha256(b"rwkv-initial-state-v1\n")
+    for n, a in arrs:
+        h.update(n.encode() + b"\0" + (",".join(map(str, a.shape)) + "\n").encode())
+        h.update(a.tobytes())
+    return "sha256:" + h.hexdigest()
+
+
+def initial_state_fingerprint(model) -> str:
+    """Отпечаток состояния, подключённого к модели сейчас (`none` без него)."""
+    return state_fingerprint(attached_state(model))
+
+
 # ── Файл ────────────────────────────────────────────────────────────────
 
 def save_state(path: str, state: RWKVState, model, kind: str = "tuned",

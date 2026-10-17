@@ -106,9 +106,13 @@ Every later query only pays for its own ~30 tokens. On a 0.1B base this is
 `n_layer · n_head · 64 · 64 · 4` bytes — 2.4 MB per document at 0.1B — so an
 index is for a hot subset (the embedder's top-100), not a whole corpus.
 
-An index is only valid for the base, template, truncation and instruction it was
-built with — the state is a function of exactly that prefix. `DocIndex` records
-those and `score_indexed` raises on a mismatch instead of returning plausible
+An index is only valid for the base, template, truncation, instruction and
+attached initial state it was built with — the state is a function of exactly
+that prefix, and the prefix fold starts from the state attached to the base
+(`attach_state`, see [state-tuning.md](state-tuning.md)). `DocIndex` records
+those (`initial_state`: `none` without a state or with an all-zero one,
+otherwise `sha256:…` from `state_fingerprint`, bit-identical to SwiftRWKV's)
+and `score_indexed` raises on a mismatch instead of returning plausible
 numbers. The one thing it cannot check is that you swapped the base checkpoint
 underneath it.
 
@@ -353,10 +357,14 @@ One trap worth naming: `mx.compile` must be given `inputs=[head.state]`.
 Without it the weights are frozen into the graph on the first call, and every
 subsequent `load_head` or optimiser step silently does nothing.
 
-The catch: the cache is only valid for that base, template, truncation and
-candidate set. Change any of them and it must be rebuilt — `run_reranker.py`
-checks shape compatibility and refuses to load a mismatched cache, but it
-cannot detect a changed base checkpoint. Name your cache files accordingly.
+The catch: the cache is only valid for that base, template, truncation,
+candidate set and attached initial state. Change any of them and it must be
+rebuilt — `run_reranker.py` checks shape compatibility and the state
+(`StateCache.initial_state`, saved in `.idx.npz`; a file without it reads as
+`none`, so rebuild one made with a state attached before this field existed)
+and refuses to load a mismatched cache, but it cannot detect a changed base
+checkpoint. `train_reranker` refuses a held-out cache built under another
+state. Name your cache files accordingly.
 
 ---
 

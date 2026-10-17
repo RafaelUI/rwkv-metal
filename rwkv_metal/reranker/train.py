@@ -133,6 +133,10 @@ def train_reranker(reranker, train_cache: StateCache,
     """save_extra: дополнительные метаданные в чекпоинт головы — сюда стоит
     класть контракт подачи текста (`RerankerInference.serving_metadata()`)."""
     cfg = cfg or RerankTrainConfig()
+    if eval_cache is not None and eval_cache.initial_state != train_cache.initial_state:
+        raise ValueError(
+            f"отложенный кэш собран с начальным состоянием {eval_cache.initial_state}, "
+            f"обучающий -- с {train_cache.initial_state}")
     head = reranker.head
     rng = np.random.default_rng(cfg.seed)
 

@@ -183,9 +183,6 @@ same value, so files move between the two libraries.
 
 ## Not done
 
-- **The reranker's serving caches do not know about the attached state** (in
-  SwiftRWKV the prefix cache and the serving index check a contract of keys
-  that does not include it). Planned separately.
 - A state attached to queries only, the way an instruction is used, needs the
   attached state switched per text; not measured.
 - Instructions that differ per query — where a state could gain more than on

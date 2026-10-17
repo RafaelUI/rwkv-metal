@@ -24,6 +24,8 @@ from typing import List, Optional, Sequence, Tuple
 import mlx.core as mx
 import numpy as np
 
+from ..model.initial_state import (NO_INITIAL_STATE,
+                                   initial_state_fingerprint)
 from ..model.state import RWKVState
 from .data import DEFAULT_INSTRUCT, PairTemplate
 from .encode import _batch_ids, _encode_prefix_ids, _encode_suffix_ids
@@ -43,6 +45,10 @@ class DocIndex:
     instruct: str
     doc_first: bool
     max_doc_tokens: int = -1
+    # Отпечаток начального состояния, подключённого к базе при сборке
+    # (`state_fingerprint`; `none` -- без состояния): свёртка префикса
+    # стартует с него.
+    initial_state: str = NO_INITIAL_STATE
 
     def nbytes(self) -> int:
         return self.state.nbytes()
@@ -180,7 +186,8 @@ class RerankerInference:
         state = RWKVState.concat(parts) if len(parts) > 1 else parts[0]
         return DocIndex(state=state, docs=list(docs), instruct=instruct,
                         doc_first=self.template.doc_first,
-                        max_doc_tokens=self.max_doc_tokens)
+                        max_doc_tokens=self.max_doc_tokens,
+                        initial_state=initial_state_fingerprint(self.model.base))
 
     def _check_index(self, index: DocIndex, instruct: str):
         if index.doc_first != self.template.doc_first:
@@ -194,6 +201,12 @@ class RerankerInference:
             raise ValueError(
                 f"индекс построен с max_doc_tokens={index.max_doc_tokens}, "
                 f"сейчас {self.max_doc_tokens}"
+            )
+        now = initial_state_fingerprint(self.model.base)
+        if index.initial_state != now:
+            raise ValueError(
+                f"индекс построен с начальным состоянием {index.initial_state}, "
+                f"у модели сейчас {now}: префикс стартует с него, состояния не те"
             )
 
     def score_indexed(self, query: str, index: DocIndex,

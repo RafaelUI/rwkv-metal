@@ -88,13 +88,13 @@ def slice_cache(cache: StateCache, cache_sources, wanted) -> StateCache:
     else:
         states = cache.states[:, pos]
     return StateCache(states=states, pair_index=cache.pair_index,
-                      labels=cache.labels)
+                      labels=cache.labels, initial_state=cache.initial_state)
 
 
 def subset(cache: StateCache, rows) -> StateCache:
     a = np.asarray(rows, dtype=np.int32)
     return StateCache(states=cache.states, pair_index=cache.pair_index[a],
-                      labels=cache.labels[a])
+                      labels=cache.labels[a], initial_state=cache.initial_state)
 
 
 def memory_report() -> dict:
@@ -274,6 +274,10 @@ def main():
     if cpath and os.path.exists(npy + ".npy") and os.path.exists(npy + ".idx.npz"):
         print(f"кэш состояний загружается (memmap) из {npy}.npy")
         cache = StateCache.load(npy, mmap=True)
+        try:
+            cache.check_initial_state(probe)
+        except ValueError as e:
+            raise SystemExit(str(e))
         if cache.n_samples != len(samples) or cache.n_cand != args.candidates:
             raise SystemExit(
                 f"кэш не соответствует данным: в кэше {cache.n_samples}×"
