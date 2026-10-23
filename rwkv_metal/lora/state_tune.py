@@ -32,6 +32,7 @@ import mlx.optimizers as optim
 
 from ..model.initial_state import (attached_state, prepare_state_tuning, save_state,
                                    trained_parts)
+from ..model import rwkv7_x070 as _x070
 from ..model.state import RWKVState
 from . import sequential as _seq
 
@@ -59,6 +60,14 @@ class StateTuneConfig:
     cache_limit_gb:      float = 0.25
 
     log_every:    int = 20
+    # Типы на время обучения (23.10). cast_projection_input -- плотные проекции считают матмул
+    # в типе веса (`rwkv7_x070.CAST_DENSE_INPUT`), остаточный поток остаётся fp32: без этого
+    # fp32-выход WKV поднимает каждый bf16-вес до fp32 копией на каждом проходе. cast_wkv_output
+    # -- выход WKV в тип вычислений (`CAST_WKV_OUTPUT`), как у официала и mlx-lm: быстрее, но
+    # ошибка градиента состояния к fp32 вдвое больше (замер SwiftRWKV, g1j 1.5B: 5.7 % против
+    # 12.0 %, без приведения 5.1 %). После обучения флаги модуля возвращаются прежние.
+    cast_projection_input: bool = True
+    cast_wkv_output:       bool = False
     state_path:   Optional[str] = "state.safetensors"
     note:         str = ""              # в метаданные файла: имя базы, пресет
 
@@ -82,6 +91,15 @@ def state_tune(model, batches: Iterable[Tuple[mx.array, mx.array]], cfg: StateTu
     """
     if cfg.cache_limit_gb and cfg.cache_limit_gb > 0:
         mx.set_cache_limit(int(cfg.cache_limit_gb * 1e9))
+    saved = (_x070.CAST_DENSE_INPUT, _x070.CAST_WKV_OUTPUT)
+    _x070.CAST_DENSE_INPUT, _x070.CAST_WKV_OUTPUT = cfg.cast_projection_input, cfg.cast_wkv_output
+    try:
+        return _state_tune(model, batches, cfg, init, on_step)
+    finally:
+        _x070.CAST_DENSE_INPUT, _x070.CAST_WKV_OUTPUT = saved
+
+
+def _state_tune(model, batches, cfg, init, on_step) -> dict:
     n = prepare_state_tuning(model, init=init, train=cfg.train)
     if hasattr(model, "_grad_ckpt"):
         model._grad_ckpt = False

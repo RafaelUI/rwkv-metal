@@ -26,6 +26,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
+from ..model import rwkv7_x070 as _x070
+
 # Счётчик вызовов: градиент побитно равен автограду, и по числам режим не
 # виден -- тесты смотрят сюда.
 CALLS = 0
@@ -250,7 +252,7 @@ def value_and_grad(model, x: mx.array, y: mx.array, loss_chunk: Optional[int] = 
         targets = y[:, lo:hi].reshape(-1)
 
         def piece(hc, targets=targets):
-            logits = model.head(hc)
+            logits = _x070.dense(model.head, hc)
             V = logits.shape[-1]
             return nn.losses.cross_entropy(logits.reshape(-1, V), targets,
                                            reduction="sum").astype(mx.float32)

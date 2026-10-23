@@ -50,6 +50,33 @@ from .state import RWKVState, gather_last
 # процессе — иначе замер ловил бы разницу прогонов, а не веток.
 CAST_WKV_OUTPUT = False
 
+# ─────────────────────────────────────────────────────────────────────────
+# ПРИВЕДЕНИЕ ВХОДА ПЛОТНОЙ ПРОЕКЦИИ (23.10), по умолчанию ВЫКЛЮЧЕНО; state_tune
+# включает его на время обучения (StateTuneConfig.cast_projection_input).
+#
+# Та же течь fp32, что выше, но закрытая на стороне матмула, как `_matmul_cast`
+# квантованного слоя (rwkvq_linear, 22.08, решение владельца): вход проекции
+# приводится к типу ВЕСА, матмул -- в типе веса, выход -- обратно в тип входа.
+# Остаточный поток остаётся fp32; вес больше не копируется в fp32 на каждом
+# проходе. Касается r/k/v/o, ключа и значения channel-mix и головы -- того же
+# набора, что и `castDenseProjectionInput` в SwiftRWKV; LoRA-ветки w/a/v/g и
+# обёртки адаптеров (не голый nn.Linear) идут прежним путём.
+#
+# Замер (SwiftRWKV, тот же счёт; g1j 1.5B bf16, T 320, M4, 23.10): шаг state-tuning
+# по блокам 1.767 -> 1.475 с; градиент состояния к счёту целиком в fp32 5.1 % ->
+# 5.7 % (приведение выхода WKV: 12.0 %).
+CAST_DENSE_INPUT = False
+
+
+def dense(layer, x):
+    """Плотная проекция; при CAST_DENSE_INPUT и входе не в типе веса -- матмул в типе веса."""
+    if CAST_DENSE_INPUT and type(layer) is nn.Linear and x.dtype != layer.weight.dtype:
+        y = x.astype(layer.weight.dtype) @ layer.weight.T
+        if "bias" in layer:
+            y = y + layer.bias
+        return y.astype(x.dtype)
+    return layer(x)
+
 
 def l2_norm(x):
     return x / mx.sqrt((x * x).sum(axis=-1, keepdims=True) + 1e-12)
@@ -139,9 +166,9 @@ class RWKV_Tmix_x070(nn.Module):
         xa = x + xx * self.x_a
         xg = x + xx * self.x_g
 
-        r = self.r_proj(xr).reshape(B, T, H, S)
-        k = self.k_proj(xk).reshape(B, T, H, S)
-        v = self.v_proj(xv).reshape(B, T, H, S)
+        r = dense(self.r_proj, xr).reshape(B, T, H, S)
+        k = dense(self.k_proj, xk).reshape(B, T, H, S)
+        v = dense(self.v_proj, xv).reshape(B, T, H, S)
 
         # gate: sigmoid ВНУТРИ, линейно наружу
         g = self.g_lora_B(mx.sigmoid(self.g_lora_A(xg)))
@@ -201,7 +228,7 @@ class RWKV_Tmix_x070(nn.Module):
         bonus = (r * k * self.r_k).sum(axis=-1, keepdims=True) * v
         out = (out + bonus).reshape(B, T, D)
 
-        y = self.o_proj(out * g)
+        y = dense(self.o_proj, out * g)
         if return_state:
             return y, v_first, h_out
         return y, v_first
@@ -218,7 +245,7 @@ class RWKV_CMix_x070(nn.Module):
     def __call__(self, x, x_prev=None):
         xx = _token_shift(x, x_prev) - x   # шифтует СВОЙ вход, нулевой паддинг t=0
         xk = x + xx * self.x_k
-        return self.value(nn.relu(self.key(xk)) ** 2)
+        return dense(self.value, nn.relu(dense(self.key, xk)) ** 2)
 
 
 class RWKVBlock(nn.Module):
@@ -356,7 +383,7 @@ class RWKV7X070(nn.Module):
         return st
 
     def __call__(self, idx):
-        return self.head(self.body(idx))
+        return dense(self.head, self.body(idx))
 
     def loss(self, idx, targets):
         logits = self(idx)
