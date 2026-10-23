@@ -164,6 +164,25 @@ gradient goes through every layer; 0.1B `reduction`, batch 4 × 512: 1740
 against 4267 tok/s) at about the same memory (1.57 against 1.68 GB). 1.5B over a
 compressed base fits a 3 GB budget at 1 × 512, where its top layers do not.
 
+**Types on a dense bf16 base (23.10).** The WKV kernel returns fp32; uncast, that
+fp32 flows into the residual stream and every `nn.Linear` lifts its bf16 weight to
+an fp32 copy on every pass. `StateTuneConfig` sets two module flags for the duration
+of `state_tune` and restores them afterwards:
+
+- `cast_projection_input=True` (default) — `rwkv7_x070.CAST_DENSE_INPUT`: r/k/v/o,
+  the channel-mix key and value and the head run their matmul in the weight's type
+  and return the input's type (the same rule as the quantized layers' `_matmul_cast`,
+  22.08); the residual stream stays fp32.
+- `cast_wkv_output=False` — `CAST_WKV_OUTPUT`: the WKV output in the compute type,
+  as in the official implementation and mlx-lm.
+
+g1j 1.5B bf16, one sequence of 320 tokens, M4, arms interleaved in one process,
+block by block: no cast 1.720 s per step, projection cast **1.442 s**, WKV-output
+cast 1.270 s. The WKV-output cast is faster but doubles the state gradient's error
+against an all-fp32 pass (measured in SwiftRWKV: 12.0 % against 5.7 % with the
+projection cast and 5.1 % uncast), hence the default. `mx.compile` over the whole
+graph adds 5.5 % (1.101 → 1.041 s for the gradient, bit-identical).
+
 ## The file
 
 A separate safetensors file: the three tensors in fp32 and metadata —
