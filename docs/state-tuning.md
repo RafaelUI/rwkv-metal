@@ -179,9 +179,36 @@ of `state_tune` and restores them afterwards:
 g1j 1.5B bf16, one sequence of 320 tokens, M4, arms interleaved in one process,
 block by block: no cast 1.720 s per step, projection cast **1.442 s**, WKV-output
 cast 1.270 s. The WKV-output cast is faster but doubles the state gradient's error
-against an all-fp32 pass (measured in SwiftRWKV: 12.0 % against 5.7 % with the
-projection cast and 5.1 % uncast), hence the default. `mx.compile` over the whole
+against an all-fp32 pass (measured in SwiftRWKV on 16 windows: 10.5 % against 5.8 %
+with the projection cast and 4.9 % uncast, ×1.78 [1.58; 2.00]; in fp16 all three are
+0.6–1.6 %). The trained state does not see it: on g1d 0.4B ("Neuron", 300 steps,
+3 seeds, held-out teacher answers) the last state's held-out loss differs from an
+fp32-trained one by −0.007 to +0.013 across bf16/fp16 and all three casts. The
+default stays the projection cast. `mx.compile` over the whole
 graph adds 5.5 % (1.101 → 1.041 s for the gradient, bit-identical).
+
+### Weight streaming (opt-in)
+
+Block-by-block backward keeps one block's activations in memory, but the weights
+of the whole model still sit there. `model/weight_stream.load_streaming(path,
+dtype)` builds the model from a dense `.safetensors` (the `convert.save_converted`
+format) lazily — `mx.load` reads a tensor only when it is evaluated — and the
+block-by-block paths let go of what they read: a block's weights after that block
+in the forward and the backward pass, the embedding table after the stem, the head
+after the loss. Trainable parameters (the state, adapters) are never touched.
+
+```python
+from rwkv_metal.model.weight_stream import load_streaming
+model = load_streaming("g1j_1.5b.safetensors", dtype=mx.bfloat16)
+res = state_tune(model, batches, StateTuneConfig(max_steps=300))
+```
+
+The numbers are those of the same file loaded into memory, bit for bit. g1j 1.5B
+bf16, one sequence of 320 tokens, block by block, M4, separate processes, two
+rounds, no swap: step 1.601 / 1.470 s in memory, 1.747 / 1.739 s streaming; peak
+process footprint 3.79 / 3.82 GB against **0.95 / 0.97 GB**. A whole-graph pass
+(`model(x)`) reads every weight and keeps it until `release_all(model)`. A `.rwkvq`
+base is not streamed here (SwiftRWKV streams it through a spill file).
 
 ## The file
 
