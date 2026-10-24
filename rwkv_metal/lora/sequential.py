@@ -27,6 +27,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from ..model import rwkv7_x070 as _x070
+from ..model import weight_stream as _ws
 
 # Счётчик вызовов: градиент побитно равен автограду, и по числам режим не
 # виден -- тесты смотрят сюда.
@@ -98,6 +99,9 @@ def forward_trace(model, x: mx.array, first: Optional[int], stride: int = 1):
     global TRACES
     TRACES += 1
     h = model.ln0(model.emb(x))
+    if _ws.streaming(model):                  # подкачка весов: таблица -- после основания
+        mx.eval(h)
+        _ws.release_stem(model)
     block_input = {}
     v_first = None
     for l, blk in enumerate(blocks):
@@ -105,6 +109,7 @@ def forward_trace(model, x: mx.array, first: Optional[int], stride: int = 1):
             block_input[l] = h
         h, v_first = blk(h, v_first)
         mx.eval(h, v_first)
+        _ws.release_layer(model, l)
     return h, block_input, v_first
 
 
@@ -119,6 +124,7 @@ def _restore_input(model, block_input: dict, l: int, first: int, v_first):
     for j in range(s, l):
         h, _ = model.blocks[j](h, v_first if j > 0 else None)
         mx.eval(h)
+        _ws.release_layer(model, j)
         block_input[j + 1] = h
 
 
@@ -182,6 +188,7 @@ def backward_blocks(model, block_input: dict, v_first, dx: mx.array, grads: dict
         for k, gk in zip(ks, g[n_data:]):
             ready.append(_add(grads, f"blocks.{l}.{k}", gk))
         mx.eval(ready)
+        _ws.release_layer(model, l)
         del block_input[l]
 
     if stem_needed:
@@ -206,6 +213,7 @@ def backward_blocks(model, block_input: dict, v_first, dx: mx.array, grads: dict
         for name, gk in zip(names, g):
             ready.append(_add(grads, name, gk))
         mx.eval(ready)
+        _ws.release_stem(model)
 
 
 def loss_piece_positions(loss_chunk: Optional[int], batch: int, length: int) -> int:
@@ -265,6 +273,7 @@ def value_and_grad(model, x: mx.array, y: mx.array, loss_chunk: Optional[int] = 
     dx = mx.vjp(lambda a: model.ln_out(a), [h], [dh])[1][0]
     loss = total * scale
     mx.eval(dx, loss)
+    _ws.release_head(model)
     del pieces, hn
 
     # ── 3. блоки сверху вниз ──
