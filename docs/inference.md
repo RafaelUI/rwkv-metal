@@ -2,7 +2,7 @@
 
 This guide covers running RWKV-7 for inference on Apple Silicon: scoring or
 generating from a **bf16** checkpoint, and running a **quantized `.rwkvq`**
-checkpoint produced by [`rwkv-quant`](https://github.com/impulseleap/rwkv-quant).
+checkpoint produced by [`rwkv-quant`](https://github.com/RafaelUI/rwkv-quant).
 
 - [Concepts](#concepts)
 - [bf16 inference](#bf16-inference)

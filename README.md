@@ -101,7 +101,7 @@ logits = model(mx.array(ids)[None, :])[0, -1]   # next-token distribution
 ```
 
 Works the same way for a quantized `.rwkvq` checkpoint (2-3x smaller, via the
-companion [rwkv-quant](https://github.com/impulseleap/rwkv-quant) repo). See
+companion [rwkv-quant](https://github.com/RafaelUI/rwkv-quant) repo). See
 **[docs/inference.md](docs/inference.md)** for sampling, streaming decode with
 state, and the quantized-inference pipeline.
 

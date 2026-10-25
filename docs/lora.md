@@ -179,7 +179,7 @@ dequantization. This is what lets a 1.5B fine-tune fit comfortably in 16 GB.
 
 ## QLoRA on a quantized `.rwkvq` base (rwkv-quant)
 
-[`rwkv-quant`](https://github.com/impulseleap/rwkv-quant) is a companion
+[`rwkv-quant`](https://github.com/RafaelUI/rwkv-quant) is a companion
 project that calibrates RWKV-7-specific quantization (per-group bit widths,
 outlier handling) instead of quantizing every matrix uniformly, and ships two
 presets tuned by direct perplexity measurement:
