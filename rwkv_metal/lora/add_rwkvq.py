@@ -10,7 +10,7 @@ REDUCTION/COMPRESSION калибровались на официальном x07
 emb.weight ПОКА не подключён: nn.Embedding делает gather по индексам, а
 не x@W^T; RwkvqLinear рассчитан на Linear-семантику. Полный dense-декванд
 65536x2048 таблицы ради лукапа нескольких строк -- пустая трата, нужен
-отдельный indexed-gather-путь (см. NEXT_SESSION/задачи) -- не сделан.
+отдельный indexed-gather-путь -- не сделан.
 
 load_lora_rwkvq_model() -- предпочтительный вход: грузит .pth и сразу
 подменяет proj/cmix/head на RwkvqLinear ДО материализации их случайной
