@@ -4,6 +4,29 @@
 
 ### Added
 
+- **Weight streaming for block-by-block training** (`model/weight_stream.py`,
+  opt-in): `load_streaming(path, dtype)` builds the model from a dense
+  `.safetensors` lazily, and the block-by-block paths (`lora/sequential.py`)
+  release a block's weights after that block, the embedding table after the
+  stem and the head after the loss; trainable parameters are never touched.
+  Numbers are bit-identical to the in-memory model. g1j 1.5B bf16 state-tuning,
+  T 320: peak footprint 3.8 -> 0.95 GB at +9...18 % step time. A `.rwkvq` base
+  is not streamed. Port of SwiftRWKV `loadStreaming`. Gate:
+  `tests/test_weight_stream.py` (9 mutation caps).
+- **`rwkv_metal.stats.paired`** — one paired bootstrap for quality comparisons
+  instead of one-off scripts: `paired_bootstrap(a, b, units="items" |
+  "seed_item", level, seed)` returns the mean per-item difference, a percentile
+  interval and significance; `reciprocal_ranks`, `load_per_row` (per-row
+  reports of `embed-run` / `gen-run`), `compare_table`; CLI
+  `python -m rwkv_metal.stats.paired --a ... --b ... [--ranks]`. numpy only.
+  Gate: `tests/test_paired_stats.py` (12 mutation caps).
+- **Reranker caches know the attached initial state**: `DocIndex.initial_state`
+  and `StateCache.initial_state` (in `.idx.npz`; a file without the key reads as
+  `none`) hold `initial_state_fingerprint` — `none` without a state or with an
+  all-zero one, otherwise sha256 over the three tensors in fp32, bit for bit
+  SwiftRWKV `StateFile.stateFingerprint`. `score_indexed`, cache reuse in
+  `run_reranker` and `train_reranker` on a held-out cache refuse a different
+  state. Gate: `tests/test_reranker_state_contract.py` (11 mutation caps).
 - **Training the top layers over a quantized base** (`lora/top_layers.py`):
   `prepare_top_layers(base, n)` unpacks the projections of the top `n` blocks of
   a `.rwkvq` base into dense fp32 `nn.Linear`, freezes the rest and trains those
@@ -19,6 +42,22 @@
 
 ### Changed
 
+- **Types during state-tuning on a dense base** (`StateTuneConfig`):
+  `cast_wkv_output=True` by default (the WKV output in the compute type, as in
+  the official implementation) and `cast_projection_input=False`
+  (`rwkv7_x070.CAST_DENSE_INPUT`: dense projections multiply in the weight's
+  type). `state_tune` sets the module flags for the run and restores them. g1j
+  1.5B bf16, T 320, block by block: 1.720 s per step uncast, 1.442 s with the
+  projection cast, 1.270 s with the WKV-output cast; the trained state's
+  held-out loss does not see the difference (0.4B, 3 seeds, −0.007
+  [−0.019; +0.005] against fp32). Gate: `tests/test_state_cast.py` (13 mutation
+  caps). See `docs/state-tuning.md`.
+- **Mutation gates count a broken mutation as broken, not caught**: in the five
+  gates with `--mutations` (`reranker_state_contract`, `state_tuning`,
+  `weight_stream`, `state_cast`, `top_layers`) the target substring was checked
+  inside the child process, so a missing or non-unique substring crashed it and
+  read as caught. Substrings are now checked before the run, and a broken
+  mutation fails it (none of the 64 is broken).
 - **`loss_chunk_tokens` is a budget for the whole batch**, not per row
   (`LoRAConfig`, `StateTuneConfig`): a head piece is `[B · positions, V]` in
   fp32, and per-row pieces let the head hold the step's peak as the batch grew.
@@ -84,6 +123,11 @@
 - `lora.dense_weight()` / `dense_parameters()`: the dense weight of a linear
   layer over any base (`nn.Linear`, `nn.QuantizedLinear`, `LoRALinear`, every
   `.rwkvq` backend), bit-identical to `rwkv_quant.formats.codec`.
+
+### Removed
+
+- `EMBEDDING_HANDOFF.md`, `rwkv-metal.md`, `NEXT_SESSION.md` — working notes
+  that went out of date; `README.md` and `docs/` are the description.
 
 ### Fixed
 
