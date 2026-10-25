@@ -224,14 +224,23 @@ def all_mutations():
     """Каждая крышка -- отдельным процессом; гейт обязан упасть на каждой."""
     import subprocess
     missed = []
+    # Мутация, подстроки которой нет в исходнике или она не единственна, —
+    # СЛОМАНА, а не поймана: в дочернем процессе она падает на сверке
+    # подстроки, и без этой проверки такой падёж засчитывался как «поймана».
+    broken = [n for n, (t, a, _) in MUTATIONS.items()
+              if open(os.path.join(ROOT, t), encoding="utf-8").read().count(a) != 1]
+    for n in broken:
+        print(f"  {n} СЛОМАНА: подстрока не единственна или её нет")
     for name in MUTATIONS:
+        if name in broken:
+            continue
         r = subprocess.run([sys.executable, os.path.abspath(__file__)],
                            env=dict(os.environ, CAST_MUT=name), capture_output=True, text=True)
         why = [l for l in (r.stdout + r.stderr).splitlines() if "Error" in l]
         print(f"  {name:11s} {'ПОЙМАНА' if r.returncode else 'НЕ ПОЙМАНА'}  {(why[-1] if why else '')[:110]}")
         if r.returncode == 0:
             missed.append(name)
-    assert not missed, f"не пойманы: {missed}"
+    assert not broken and not missed, f"сломаны: {broken}, не пойманы: {missed}"
     print(f"все {len(MUTATIONS)} крышек держат")
 
 

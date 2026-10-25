@@ -193,14 +193,22 @@ def main():
 def all_mutations():
     import subprocess
     missed = []
+    # Мутация, подстроки которой нет в исходнике или она не единственна, —
+    # СЛОМАНА, а не поймана (см. tests/test_state_cast.py).
+    src = open(SRC, encoding="utf-8").read()
+    broken = [n for n, (a, _) in MUTATIONS.items() if src.count(a) != 1]
+    for n in broken:
+        print(f"  {n} СЛОМАНА: подстрока не единственна или её нет")
     for name in MUTATIONS:
+        if name in broken:
+            continue
         r = subprocess.run([sys.executable, os.path.abspath(__file__)], env=dict(os.environ, TOP_MUT=name),
                            capture_output=True, text=True)
         why = [l for l in (r.stdout + r.stderr).splitlines() if "Error" in l]
         print(f"  {name:8s} {'ПОЙМАНА' if r.returncode else 'НЕ ПОЙМАНА'}  {(why[-1] if why else '')[:100]}")
         if r.returncode == 0:
             missed.append(name)
-    assert not missed, f"не пойманы: {missed}"
+    assert not broken and not missed, f"сломаны: {broken}, не пойманы: {missed}"
     print(f"все {len(MUTATIONS)} крышек держат")
 
 
