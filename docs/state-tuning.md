@@ -169,22 +169,22 @@ fp32 flows into the residual stream and every `nn.Linear` lifts its bf16 weight 
 an fp32 copy on every pass. `StateTuneConfig` sets two module flags for the duration
 of `state_tune` and restores them afterwards:
 
-- `cast_projection_input=True` (default) — `rwkv7_x070.CAST_DENSE_INPUT`: r/k/v/o,
+- `cast_wkv_output=True` (**default** since 25.10) — `CAST_WKV_OUTPUT`: the WKV output
+  in the compute type, as in the official implementation and mlx-lm.
+- `cast_projection_input=False` — `rwkv7_x070.CAST_DENSE_INPUT`: r/k/v/o,
   the channel-mix key and value and the head run their matmul in the weight's type
   and return the input's type (the same rule as the quantized layers' `_matmul_cast`,
   22.08); the residual stream stays fp32.
-- `cast_wkv_output=False` — `CAST_WKV_OUTPUT`: the WKV output in the compute type,
-  as in the official implementation and mlx-lm.
 
 g1j 1.5B bf16, one sequence of 320 tokens, M4, arms interleaved in one process,
-block by block: no cast 1.720 s per step, projection cast **1.442 s**, WKV-output
-cast 1.270 s. The WKV-output cast is faster but doubles the state gradient's error
+block by block: no cast 1.720 s per step, projection cast 1.442 s, WKV-output
+cast **1.270 s**. The WKV-output cast is faster but doubles the state gradient's error
 against an all-fp32 pass (measured in SwiftRWKV on 16 windows: 10.5 % against 5.8 %
 with the projection cast and 4.9 % uncast, ×1.78 [1.58; 2.00]; in fp16 all three are
 0.6–1.6 %). The trained state does not see it: on g1d 0.4B ("Neuron", 300 steps,
 3 seeds, held-out teacher answers) the last state's held-out loss differs from an
-fp32-trained one by −0.007 to +0.013 across bf16/fp16 and all three casts. The
-default stays the projection cast. `mx.compile` over the whole
+fp32-trained one by −0.007 to +0.013 across bf16/fp16 and all three casts, so the
+default is the fastest, the WKV-output cast. `mx.compile` over the whole
 graph adds 5.5 % (1.101 → 1.041 s for the gradient, bit-identical).
 
 ### Weight streaming (opt-in)

@@ -2,8 +2,8 @@
 
 `rwkv7_x070.dense` при CAST_DENSE_INPUT считает матмул в типе веса и возвращает
 выход в типе входа (как `_matmul_cast` квантованного слоя, 22.08); state_tune
-включает его на время обучения (`StateTuneConfig.cast_projection_input`, умолчание),
-а `cast_wkv_output` -- приведение выхода WKV (`CAST_WKV_OUTPUT`, выключено). После
+включает его на время обучения (`StateTuneConfig.cast_projection_input`, по выбору),
+а `cast_wkv_output` -- приведение выхода WKV (`CAST_WKV_OUTPUT`, умолчание с 25.10). После
 обучения флаги модуля -- прежние. База -- плотная 0.1B из .pth в bf16: в fp32 оба
 приведения -- тождество, и гейт ничего бы не видел.
 
@@ -36,8 +36,8 @@ X070 = "rwkv_metal/model/rwkv7_x070.py"
 TUNE = "rwkv_metal/lora/state_tune.py"
 SEQ = "rwkv_metal/lora/sequential.py"
 MUTATIONS = {
-    "default": (TUNE, "    cast_projection_input: bool = True", "    cast_projection_input: bool = False"),
-    "wkvdefault": (TUNE, "    cast_wkv_output:       bool = False", "    cast_wkv_output:       bool = True"),
+    "default": (TUNE, "    cast_projection_input: bool = False", "    cast_projection_input: bool = True"),
+    "wkvdefault": (TUNE, "    cast_wkv_output:       bool = True", "    cast_wkv_output:       bool = False"),
     "noset": (TUNE, "    _x070.CAST_DENSE_INPUT, _x070.CAST_WKV_OUTPUT = cfg.cast_projection_input, cfg.cast_wkv_output",
                     "    pass"),
     "swap": (TUNE, "    _x070.CAST_DENSE_INPUT, _x070.CAST_WKV_OUTPUT = cfg.cast_projection_input, cfg.cast_wkv_output",
@@ -121,7 +121,7 @@ def random_state(model, seed=3, scale=0.05):
 def main():
     assert x070.CAST_DENSE_INPUT is False and x070.CAST_WKV_OUTPUT is False, "умолчания модуля сдвинулись"
     c = StateTuneConfig()
-    assert c.cast_projection_input is True and c.cast_wkv_output is False, "умолчания StateTuneConfig"
+    assert c.cast_projection_input is False and c.cast_wkv_output is True, "умолчания StateTuneConfig (25.10)"
     m = load_pretrained(PTH, verbose=False)[0]
     L, D = len(m.blocks), m.blocks[0].tmix.r_proj.weight.shape[1]
 
@@ -203,15 +203,17 @@ def main():
                 loss_chunk_tokens=0, state_path=None)
     a, after1 = tune(StateTuneConfig(**base), (False, False))
     a2, after2 = tune(StateTuneConfig(**base), (True, True))
-    n, after3 = tune(StateTuneConfig(**base, cast_projection_input=False), (True, False))
-    n2, _ = tune(StateTuneConfig(**base, cast_projection_input=False), (False, True))
-    w, after4 = tune(StateTuneConfig(**base, cast_projection_input=False, cast_wkv_output=True), (False, False))
-    w2, _ = tune(StateTuneConfig(**base, cast_projection_input=False, cast_wkv_output=True), (True, False))
+    off = dict(cast_projection_input=False, cast_wkv_output=False)
+    lin = dict(cast_projection_input=True, cast_wkv_output=False)
+    n, after3 = tune(StateTuneConfig(**base, **off), (True, False))
+    n2, _ = tune(StateTuneConfig(**base, **off), (False, True))
+    w, after4 = tune(StateTuneConfig(**base, **lin), (False, False))
+    w2, _ = tune(StateTuneConfig(**base, **lin), (False, True))
     assert same(a, a2), "умолчание: исход зависит от флагов модуля"
     assert same(n, n2), "без приведения: исход зависит от флагов модуля"
-    assert same(w, w2), "выход WKV: исход зависит от флагов модуля"
-    assert not same(a, n), "cast_projection_input не действует"
-    assert not same(w, n), "cast_wkv_output не действует"
+    assert same(w, w2), "вход проекций: исход зависит от флагов модуля"
+    assert not same(a, n), "cast_wkv_output (умолчание) не действует"
+    assert not same(w, n), "cast_projection_input не действует"
     assert (after1, after2, after3, after4) == ((False, False), (True, True), (True, False), (False, False)), \
         f"флаги модуля после обучения не возвращены: {(after1, after2, after3, after4)}"
     print("  обучение: исход -- от конфигурации, флаги возвращены, оба поля действуют")
