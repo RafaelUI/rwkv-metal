@@ -40,6 +40,9 @@
   tokens (`EVALUATION_BATCH_TOKENS`, 4096), body evaluated block by block — bit
   for bit `model.embed`, without one lazy graph over all layers.
 
+- Extra `rwkvq` (`pip install "rwkv-metal[rwkvq]"`): `rwkv-quant>=0.3.0`, needed
+  for `.rwkvq` bases (current presets need its `SymQuantLinear.from_interleaved`).
+
 ### Changed
 
 - **Types during state-tuning on a dense base** (`StateTuneConfig`):

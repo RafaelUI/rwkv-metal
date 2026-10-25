@@ -37,6 +37,7 @@ pip install -e .
 # optional extras:
 pip install -e ".[data]"    # tokenizers, for .txt -> .bin tokenization
 pip install -e ".[wandb]"   # Weights & Biases logging
+pip install -e ".[rwkvq]"   # rwkv-quant, for .rwkvq bases (pulls PyTorch)
 ```
 
 You can also run without installing, from the repo root:
